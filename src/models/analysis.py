@@ -1,0 +1,30 @@
+from sqlalchemy import CHAR, Column, DateTime, ForeignKey, Integer, SmallInteger, UniqueConstraint, func
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.orm import relationship
+from models.base import Base
+from models import AnalysisStatus, PixTransaction
+
+
+class Analysis(Base):
+    __tablename__ = "analysis"
+
+    id = Column(Integer, primary_key=True)
+    analysis_key = Column(CHAR(36), nullable=False)
+    pix_transaction_id = Column(Integer, ForeignKey(PixTransaction.id), nullable=False)
+    status_id = Column(Integer, ForeignKey(AnalysisStatus.id), nullable=False)
+    risk_score = Column(SmallInteger, nullable=False)
+    # O nome da coluna é "metadata", mas `metadata` é palavra reservada
+    # das classes do SQLAlchemy (é onde ele guarda a descrição das
+    # tabelas). Por isso o atributo Python tem outro nome.
+    analysis_metadata = Column("metadata", JSONB, nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("analysis_key"),
+        UniqueConstraint("pix_transaction_id"),
+    )
+
+    pix_transaction = relationship("PixTransaction", foreign_keys=[pix_transaction_id], back_populates="analysis")
+    status = relationship("AnalysisStatus", foreign_keys=[status_id], lazy="selectin")
+    rule_results = relationship("RuleResult", back_populates="analysis", order_by="asc(RuleResult.id)")
+    two_factor_result = relationship("TwoFactorResult", back_populates="analysis", uselist=False, lazy="selectin")
