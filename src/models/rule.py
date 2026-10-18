@@ -22,3 +22,4 @@ class Rule(Base):
 
     SCORE = "score"
     REJECT = "reject"
+    TWO_FACTOR = "two_factor"

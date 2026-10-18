@@ -221,7 +221,7 @@ def check_day_sum_without_history(facts: dict) -> Optional[dict]:
     return _day_sum_observed(facts)
 
 
-def check_far_from_usual_places(facts: dict) -> Optional[dict]:
+def check_street_mode(facts: dict) -> Optional[dict]:
     location = facts["location"]
     known_places = facts["known_places"]
 
@@ -328,6 +328,7 @@ RULE_CHECKS: Dict[str, Callable[[dict], Optional[dict]]] = {
     "restricted_payer": check_restricted_payer,
     "restricted_destination": check_restricted_destination,
     "receita_destination_blocked": check_receita_destination_blocked,
+    "street_mode": check_street_mode,
     "unusual_hour": check_unusual_hour,
     "rare_hour": check_rare_hour,
     "night_without_history": check_night_without_history,
@@ -338,7 +339,6 @@ RULE_CHECKS: Dict[str, Callable[[dict], Optional[dict]]] = {
     "night_limit_exceeded": check_night_limit_exceeded,
     "day_sum_3x_profile": check_day_sum_3x_profile,
     "day_sum_without_history": check_day_sum_without_history,
-    "far_from_usual_places": check_far_from_usual_places,
     "burst_4_in_10_minutes": check_burst_4_in_10_minutes,
     "burst_3_in_10_minutes": check_burst_3_in_10_minutes,
     "new_destination": check_new_destination,
@@ -431,12 +431,14 @@ def decide(signals: List[dict], metric_scores: List[dict], inherited_points: int
     risk_score = min(MAX_RISK, transaction_risk + inherited_points)
 
     reject_signals = [signal for signal in signals if signal["action"] == Rule.REJECT]
+    two_factor_signals = [signal for signal in signals if signal["action"] == Rule.TWO_FACTOR]
     score_signals = [signal for signal in signals if signal["action"] == Rule.SCORE]
 
     risk_summary = (
         f"risco {risk_score} de {MAX_RISK} ({transaction_risk} deste Pix + {inherited_points} herdado "
         f"das últimas {MEMORY_HOURS}h)" + _metrics_summary(metric_scores)
     )
+    two_factor_summary = "; ".join(signal["description"] for signal in two_factor_signals)
 
     if reject_signals:
         status = AnalysisStatus.REJECTED
@@ -451,8 +453,15 @@ def decide(signals: List[dict], metric_scores: List[dict], inherited_points: int
     elif risk_score >= TWO_FACTOR_FROM:
         status = AnalysisStatus.TWO_FACTOR_REQUIRED
         reason = Analysis.RISK_SCORE
-        decisive_rules = [signal["rule"] for signal in score_signals]
+        decisive_rules = [signal["rule"] for signal in score_signals + two_factor_signals]
         description = f"2FA pedido: {risk_summary}"
+        if two_factor_signals:
+            description += f". Também pede 2FA: {two_factor_summary}"
+    elif two_factor_signals:
+        status = AnalysisStatus.TWO_FACTOR_REQUIRED
+        reason = Analysis.TWO_FACTOR_RULE
+        decisive_rules = [signal["rule"] for signal in two_factor_signals]
+        description = f"2FA pedido por regra de autenticação ({two_factor_summary}), com {risk_summary}"
     else:
         status = AnalysisStatus.APPROVED
         reason = Analysis.RISK_SCORE
@@ -514,10 +523,10 @@ def _hour_observed(facts: dict) -> dict:
 def _amount_ratio_between(facts: dict, low: float, high: Optional[float]) -> Optional[dict]:
     history = facts["history"]
 
-    if history["trusted_count"] < MIN_TICKET_HISTORY or not history["average_ticket"]:
+    if history["trusted_count"] < MIN_TICKET_HISTORY or not history["median_ticket"]:
         return None
 
-    ratio = facts["amount"] / history["average_ticket"]
+    ratio = facts["amount"] / history["median_ticket"]
 
     if ratio < low:
         return None
@@ -525,7 +534,7 @@ def _amount_ratio_between(facts: dict, low: float, high: Optional[float]) -> Opt
     if high is not None and ratio >= high:
         return None
 
-    return {"amount": facts["amount"], "average_ticket": history["average_ticket"], "ratio": round(ratio, 1)}
+    return {"amount": facts["amount"], "median_ticket": history["median_ticket"], "ratio": round(ratio, 1)}
 
 
 def _day_sum_observed(facts: dict) -> Optional[dict]:

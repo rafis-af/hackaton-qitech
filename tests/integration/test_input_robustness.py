@@ -640,7 +640,7 @@ class TestEngineExtremes:
             transaction_date=DAYTIME + timedelta(hours=2),
         )
 
-        assert "far_from_usual_places" in ObjectGenerator.fired_rules(far)
+        assert "street_mode" in ObjectGenerator.fired_rules(far)
 
     def test_largest_amounts_add_up_without_overflow(self):
         payer = RandomGenerator.generate_cpf()

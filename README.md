@@ -34,11 +34,14 @@ O exemplo completo de requisição, os códigos HTTP e a configuração estão e
 
 Daí saem os três princípios que organizam o motor:
 
-1. **Nenhuma métrica decide sozinha.** O risco é a soma de seis métricas, e a maior delas vale 35 — abaixo dos 40 em que começa o 2FA. Isso não é só uma intenção: é um `CHECK` na tabela `risk_metric`.
-2. **O horário pesa mais que o lugar.** O celular roubado é usado quando o dono não usaria; isso diz mais do que de onde ele é usado.
+1. **Nenhuma métrica decide sozinha.** O risco é a soma de cinco métricas, e a maior delas vale 35 — abaixo dos 40 em que começa o 2FA. Isso não é só uma intenção: é um `CHECK` na tabela `risk_metric`.
+2. **O horário é a métrica que mais pesa.** O celular roubado é usado quando o dono não usaria; isso diz mais do que qualquer outro comportamento.
 3. **O risco tem prazo de validade.** Um Pix arriscado deixa parte do risco para os Pix seguintes do mesmo cliente por 24 horas — e depois vence.
 
-E uma exceção, dita em voz alta: **fatos não são métricas.** Documento que não existe, lista restritiva e CPF de pessoa falecida na Receita reprovam direto. Nenhuma métrica de *comportamento* decide sozinha; fatos objetivos, sim.
+E duas exceções, ditas em voz alta, porque nenhuma delas é métrica:
+
+- **Fatos reprovam direto.** Documento que não existe, lista restritiva e CPF de pessoa falecida na Receita. Nenhuma métrica de *comportamento* decide sozinha; fatos objetivos, sim.
+- **O Modo Rua pede 2FA direto.** Longe de todos os lugares de costume do cliente, o motor não tem como saber se é ele: pede a selfie, e aprende o lugar quando ela é confirmada. Não soma ponto e nunca reprova — só transforma um `approved` em `two_factor_required`. É uma pergunta de autenticação ("é você?"), e não uma medida de comportamento ("isso é estranho?").
 
 ### O caminho de um Pix
 
@@ -55,6 +58,7 @@ POST /pix/transaction
   ├─ 6. mede                        sinais → métricas (com teto) → risco deste Pix
   ├─ 7. herda                       o risco ainda válido dos Pix das últimas 24 h
   ├─ 8. decide                      fato? reprova. Senão, pelas faixas do risco
+  │                                 aprovado longe de casa? o Modo Rua pede 2FA
   └─ 9. grava tudo                  o Pix, a decisão, cada sinal — inclusive quando reprova
 ```
 
@@ -75,9 +79,11 @@ Cadastro de contas e front-end ficam de fora: a conta chega pronta no payload.
 
 ### O que é "normal" para o cliente
 
-Só **Pix confiáveis** ensinam o normal: aprovados direto, ou com 2FA confirmado. É com eles que o motor aprende o horário de costume, o ticket médio, os lugares de costume e os destinos conhecidos. O que o ladrão fez — reprovado, 2FA pendente ou falhado — nunca vira o normal de ninguém.
+Só **Pix confiáveis** ensinam o normal: aprovados direto, ou com 2FA confirmado. É com eles que o motor aprende o horário de costume, o ticket mediano, os lugares de costume e os destinos conhecidos. O que o ladrão fez — reprovado, 2FA pendente ou falhado — nunca vira o normal de ninguém.
 
 Já as **tentativas** contam todas, inclusive as reprovadas: a rajada do ladrão conta mesmo quando foi barrada.
+
+Como o Modo Rua pede 2FA em todo Pix longe dos lugares de costume, um lugar novo só vira "de costume" depois de uma selfie confirmada. Nenhum Pix longe é aprovado direto — então nenhum ensina o lugar sozinho.
 
 ### Modelagem de dados
 
@@ -95,10 +101,10 @@ document_situation    (cache das respostas da Receita)
 | Tabela | O que guarda | Decisões |
 |---|---|---|
 | `pix_transaction` | O Pix como chegou | Documentos só com dígitos (o mesmo CPF com e sem máscara é o mesmo pagador). `pix_id` único. Hash do payload para reconhecer o reenvio |
-| `analysis` | A decisão | **Nunca recebe UPDATE.** Guarda `transaction_risk`, `inherited_risk` e `risk_score` — e um `CHECK` garante que o terceiro é a soma dos dois, com teto de 100. `decision_reason` permite perguntar ao banco "quantos foram barrados por fato hoje?" |
+| `analysis` | A decisão | **Nunca recebe UPDATE.** Guarda `transaction_risk`, `inherited_risk` e `risk_score` — e um `CHECK` garante que o terceiro é a soma dos dois, com teto de 100. `decision_reason` (`blocking_rule`, `risk_score` ou `two_factor_rule`) permite perguntar ao banco "quantos foram barrados por fato hoje?" ou "quantos 2FA o Modo Rua pediu?" |
 | `rule_result` | Cada sinal que disparou, com o que viu | `points` é **copiado** do sinal no momento: se um peso mudar amanhã, as análises antigas continuam com o valor da época |
-| `risk_metric` | As 6 métricas e o teto de cada uma | `CHECK (max_points < 40)`: nenhuma métrica decide sozinha |
-| `rule` | Os sinais: pontos, liga/desliga, métrica | Sinal de comportamento pertence a uma métrica e vale ponto; fato não tem métrica e não vale ponto (`CHECK`) |
+| `risk_metric` | As 5 métricas e o teto de cada uma | `CHECK (max_points < 40)`: nenhuma métrica decide sozinha |
+| `rule` | Os sinais: pontos, liga/desliga, métrica, ação | Três ações: `score` (comportamento, pertence a uma métrica e vale ponto), `reject` (fato) e `two_factor` (Modo Rua). Fato e Modo Rua não têm métrica e não valem ponto (`CHECK`) |
 | `two_factor_result` | A pendência do 2FA | Nasce `pending` com a análise, com prazo (`expires_at`), e fecha uma vez: `confirmed`, `failed` ou `expired`. Estado numa coluna só, para não existir "pendente e confirmado" ao mesmo tempo |
 | `analysis_status` | Os 3 status | Catálogo com chave estrangeira, no padrão do Base Service |
 | `restricted_party` | Documentos com fraude confirmada, sanção ou ordem judicial | Local, consultado por índice: a decisão não espera a rede |
@@ -117,8 +123,7 @@ Cinco índices em `pix_transaction` cobrem as consultas do motor: toda métrica 
 | Métrica | Teto | O que pergunta |
 |---|---|---|
 | Horário | 35 | O cliente costuma pagar nesta hora? |
-| Valor | 30 | O valor cabe no ticket médio dele? Passou do teto? E a soma do dia? |
-| Local (Modo Rua) | 25 | Saiu de perto dos lugares de costume? |
+| Valor | 30 | O valor cabe no ticket mediano dele? Passou do teto? E a soma do dia? |
 | Velocidade | 20 | Quantos Pix ele fez nos últimos minutos? |
 | Destino | 15 | Ele já pagou esta conta? Ela parece laranja? |
 | Origem | 10 | O aparelho e o IP batem com a conta? |
@@ -132,7 +137,7 @@ Os sinais de uma mesma métrica somam, mas nunca passam do teto dela.
 | Limite | Passou do teto? | `night_limit_exceeded`, `high_amount_without_history` |
 | Velocity | Rápido demais? | `burst_4_in_10_minutes`, `burst_3_in_10_minutes` |
 | Montante | Somou demais? | `day_sum_3x_profile`, `day_sum_without_history` |
-| Perfil | Está no padrão do cliente? | `unusual_hour`, `rare_hour`, `night_without_history`, `amount_*_profile`, `far_from_usual_places`, `device_changed` |
+| Perfil | Está no padrão do cliente? | `unusual_hour`, `rare_hour`, `night_without_history`, `amount_*_profile`, `device_changed`, e o Modo Rua (`street_mode`), que pede 2FA |
 | Contraparte | Quem recebe é confiável? | `new_destination`, `new_destination_account`, `destination_many_payers`, `receita_destination_irregular`, `restricted_destination`, `receita_destination_blocked` |
 
 **Limite e Montante moram na métrica Valor, e não em métricas próprias.** As três perguntas (o valor cabe no ticket? passou do teto? a soma do dia passou do normal?) olham para o mesmo dinheiro. Em métricas separadas, um único Pix de R$ 5.000 à noite pontuaria três vezes pelo mesmo real e reprovaria sozinho, quebrando o princípio de que nenhuma métrica decide sozinha. Juntas, elas somam até o teto de 30.
@@ -146,15 +151,13 @@ Os sinais de uma mesma métrica somam, mas nunca passam do teto dela.
 | `rare_hour` (20) | Menos de 10% dos Pix do cliente nesta faixa | 10% | Horário que acontece, mas é exceção |
 | `night_without_history` (20) | Cliente sem histórico de horários, Pix entre 20h e 6h | 20h–6h; menos de 5 Pix confiáveis | Sem histórico, vale a referência de todo mundo: o período noturno do Banco Central (Resolução BCB nº 142/2021) |
 | **Valor** | | | |
-| `amount_5x_profile` (30) | Valor ≥ 5x o ticket médio | Mínimo de 3 Pix confiáveis | Com menos de 3 Pix, a média não diz nada |
-| `amount_3x_profile` (20) | Valor entre 3x e 5x o ticket médio | | Degraus, para que "um pouco acima" pese menos que "muito acima" |
-| `amount_2x_profile` (10) | Valor entre 2x e 3x o ticket médio | | |
-| `high_amount_without_history` (15) | Cliente sem ticket médio, Pix acima de R$ 1.000 | R$ 1.000 | Sem histórico, o limite noturno do Banco Central serve de referência de "valor alto" |
-| `night_limit_exceeded` (20) | **Limite.** Pix de pessoa física entre 20h e 6h, acima de R$ 1.000, e o cliente nunca fez um Pix noturno confiável acima disso | R$ 1.000; 20h–6h; só CPF; mínimo de 3 Pix confiáveis; 90 dias | R$ 1.000 é o limite noturno padrão do Banco Central para pessoa física (Resolução BCB nº 142/2021). O ticket médio não pega esse caso: para quem paga R$ 800 de costume, R$ 1.500 é só 1,9x. Quem já pagou acima do teto à noite, com Pix confiável, provou que aumentou o limite e não é punido. Sem histórico, `high_amount_without_history` já usa os mesmos R$ 1.000, por isso a regra não roda (contaria o mesmo fato duas vezes) |
+| `amount_5x_profile` (30) | Valor ≥ 5x o ticket mediano | Mínimo de 3 Pix confiáveis | Com menos de 3 Pix, a régua não diz nada. **Mediana, e não média:** um único Pix fora da curva (a compra do carro) puxaria a média para cima e deixaria o cliente imune a esta regra por 90 dias; a mediana não se mexe |
+| `amount_3x_profile` (20) | Valor entre 3x e 5x o ticket mediano | | Degraus, para que "um pouco acima" pese menos que "muito acima" |
+| `amount_2x_profile` (10) | Valor entre 2x e 3x o ticket mediano | | |
+| `high_amount_without_history` (15) | Cliente sem ticket mediano, Pix acima de R$ 1.000 | R$ 1.000 | Sem histórico, o limite noturno do Banco Central serve de referência de "valor alto" |
+| `night_limit_exceeded` (20) | **Limite.** Pix de pessoa física entre 20h e 6h, acima de R$ 1.000, e o cliente nunca fez um Pix noturno confiável acima disso | R$ 1.000; 20h–6h; só CPF; mínimo de 3 Pix confiáveis; 90 dias | R$ 1.000 é o limite noturno padrão do Banco Central para pessoa física (Resolução BCB nº 142/2021). O ticket mediano não pega esse caso: para quem paga R$ 800 de costume, R$ 1.500 é só 1,9x. Quem já pagou acima do teto à noite, com Pix confiável, provou que aumentou o limite e não é punido. Sem histórico, `high_amount_without_history` já usa os mesmos R$ 1.000, por isso a regra não roda (contaria o mesmo fato duas vezes) |
 | `day_sum_3x_profile` (20) | **Montante.** A soma das últimas 24 h (Pix confiáveis + este) passou de 3x o total diário médio do cliente | 3x; 24 h; mínimo de 3 dias com Pix confiável em 90 dias; ao menos 2 Pix na janela; soma acima de R$ 1.000 | Pega o golpe que **fraciona** o valor para nenhum Pix parecer grande sozinho. O total diário médio só conta dias com Pix, e só antes da janela, para o golpe em curso não inflar a própria régua. Abaixo de R$ 1.000 no dia, a soma não pesa: não compensa a fricção |
 | `day_sum_without_history` (15) | **Montante.** Cliente sem total diário médio, soma das últimas 24 h acima de R$ 1.000 | R$ 1.000; 24 h; ao menos 2 Pix na janela | Sem histórico, a mesma referência de R$ 1.000: dez Pix de R$ 900 somam R$ 9.000, mas nenhum deles passaria em `high_amount_without_history` |
-| **Local** | | | |
-| `far_from_usual_places` (25) | Pix a mais de 30 km de **todos** os lugares de costume | 30 km; lugares de Pix confiáveis em 90 dias | 30 km cobre uma região metropolitana. A distância é até o lugar **mais perto**, e não até a média: quem mora em São Paulo e trabalha em Campinas teria a média no meio da estrada. Sem geolocalização (é opcional) ou sem lugar de costume, não roda |
 | **Velocidade** | | | |
 | `burst_4_in_10_minutes` (20) | 4 ou mais Pix do cliente em 10 minutos | Conta este Pix e os reprovados | O ladrão tem pressa: sabe que a vítima vai bloquear o celular |
 | `burst_3_in_10_minutes` (10) | 3 Pix em 10 minutos | | Três amigos devolvendo a conta do bar já dão três: é só um sinal |
@@ -178,6 +181,17 @@ Os sinais de uma mesma métrica somam, mas nunca passam do teto dela.
 | `restricted_destination` | Quem recebe está na lista restritiva | Idem |
 | `receita_destination_blocked` | Na Receita, o documento de quem recebe não existe, foi cancelado, é nulo ou é de titular falecido | Ninguém legítimo recebe Pix num CPF assim: é o documento clássico de conta laranja |
 
+### O Modo Rua: pede 2FA
+
+| Regra | Lógica | Parâmetros | Por quê |
+|---|---|---|---|
+| `street_mode` | Pix a mais de 30 km de **todos** os lugares de costume do cliente pede 2FA, mesmo com risco baixo. Não soma ponto e nunca reprova | 30 km; lugares de costume = de onde saíram os Pix confiáveis (aprovados ou com 2FA confirmado) dos últimos 90 dias; a distância é até o lugar **mais perto** | O celular roubado é usado longe da rotina do dono. 30 km cobre uma região metropolitana: ir de São Paulo a Guarulhos não é viagem. Mais perto, e não a média: quem mora em São Paulo e trabalha em Campinas teria a média no meio da estrada, e todo Pix dele pediria 2FA. Sem geolocalização (é opcional) ou sem lugar de costume, não roda |
+
+- **Quem viaja faz uma selfie por cidade.** O primeiro Pix em Salvador pede 2FA; confirmado, Salvador vira lugar de costume, e os próximos Pix lá seguem sem 2FA.
+- **2FA pendente, expirado ou falhado não ensina lugar nenhum.** Senão, o ladrão transformaria a cidade dele em "de costume" — e o Modo Rua continua pedindo a selfie a cada Pix dele.
+- **Por que não é uma métrica de pontos.** Como métrica (já foi uma, de 25 pontos), longe sozinho aprovava — e o primeiro Pix aprovado longe ensinava o lugar ao ladrão. Longe dos lugares de costume, a pergunta não é "quanto isso é estranho?", é "é você?". Quem responde é a selfie, não a soma.
+- **O Modo Rua só sobe, nunca desce.** Um Pix já reprovado (por fato ou por pontos) continua reprovado; ele só transforma um `approved` em `two_factor_required`.
+
 ---
 
 ## Como as regras viram decisão
@@ -190,6 +204,7 @@ Os sinais de uma mesma métrica somam, mas nunca passam do teto dela.
        0 a 39   → approved
       40 a 69   → two_factor_required
       70 a 100  → rejected
+3. Saiu approved, mas o Modo Rua disparou? → two_factor_required
 ```
 
 Duas métricas fortes pedem 2FA; reprovar exige três. Exemplos:
@@ -197,15 +212,16 @@ Duas métricas fortes pedem 2FA; reprovar exige três. Exemplos:
 | Situação | Conta | Decisão |
 |---|---|---|
 | Aluguel de R$ 5.000, destino de sempre, horário de sempre | valor 30 | `approved` |
-| Viagem: Pix de dia, em outra cidade | local 25 + destino novo 5 | `approved` |
-| Viagem: Pix à noite, em outra cidade, cliente sem histórico de horários | horário 20 + local 25 + destino 5 | `two_factor_required` |
+| Viagem: Pix de dia, em outra cidade | destino novo 5 + **Modo Rua** | `two_factor_required` — uma selfie; confirmada, a cidade vira de costume |
+| Viagem, no dia seguinte, na mesma cidade, depois da selfie confirmada | destino novo 5 | `approved` |
 | Valor alto para conta aberta há 5 dias | valor 30 + destino 15 | `two_factor_required` |
-| Às 3h (nunca pagou nesse horário), de outra cidade, valor 6x o ticket | horário 35 + local 25 + valor 30 | `rejected` |
+| Às 3h (nunca pagou nesse horário), valor 6x o ticket, para conta aberta há 5 dias | horário 35 + valor 30 + destino 15 | `rejected` |
+| Às 3h, de outra cidade, valor 6x o ticket, destino de sempre | horário 35 + valor 30 = 65 + **Modo Rua** | `two_factor_required`. Se a selfie falhar, o próximo Pix herda os 65 e reprova com 5 pontos a mais |
 | Fracionamento: 6 Pix de R$ 900 à noite, no mesmo segundo, de cliente sem histórico | 1º: horário 20 + destino 5. 2º: + soma do dia 15 + herança 12. 3º em diante: + velocidade e herança | 1º `approved`, 2º `two_factor_required`, demais `rejected` |
 
 ### Quando o motor pede 2FA
 
-Quando o risco fica entre 40 e 69: há dúvida, e o cliente confirma que é ele mesmo. Quem pede o segundo fator (a selfie, a biometria) é o banco; o antifraude só decide quando pedir.
+Quando o risco fica entre 40 e 69, ou quando o Modo Rua dispara num Pix que sairia aprovado: há dúvida, e o cliente confirma que é ele mesmo. Quem pede o segundo fator (a selfie, a biometria) é o banco; o antifraude só decide quando pedir.
 
 O 2FA pedido nasce como **pendência com prazo de 3 minutos**. O banco informa o resultado em `POST /pix/transaction/{id}/two-factor`. A decisão original nunca muda; o que muda é a pendência:
 
@@ -234,7 +250,7 @@ O JSON do desafio, com um pagador sem histórico: R$ 1.500 às 22:15, para uma c
 | Métrica | Pontos | Por quê |
 |---|---|---|
 | Horário | 20 | Noite, cliente sem histórico de horários |
-| Valor | 15 | Acima de R$ 1.000, cliente sem ticket médio |
+| Valor | 15 | Acima de R$ 1.000, cliente sem ticket mediano |
 | Destino | 15 | Destino novo (5) + conta de 7 dias (10) |
 | **Risco** | **50** | **`two_factor_required`** |
 
@@ -264,7 +280,7 @@ O JSON do desafio, com um pagador sem histórico: R$ 1.500 às 22:15, para uma c
 }
 ```
 
-- `decision`: por que saiu este status, em uma frase.
+- `decision`: por que saiu este status, em uma frase. O `reason` diz quem decidiu: um fato (`blocking_rule`), a faixa do risco (`risk_score`) ou o Modo Rua (`two_factor_rule`).
 - `risk.metrics`: quanto cada métrica pesou — inclusive as que ficaram em zero.
 - `signals`: o que cada sinal viu.
 - `receita`: de onde veio a situação de quem recebe (`api`, `cache`, `unavailable`, `skipped`, `disabled`).
@@ -385,7 +401,7 @@ docker compose --profile tests run --build --rm tests
 
 Os testes rodam num container próprio, contra a API de pé — sem Python na máquina. São dois grupos:
 
-- `tests/integration/pix_transaction/`: os cenários pela API — contrato, fatos, cada métrica, Receita, 2FA, herança e concorrência.
+- `tests/integration/pix_transaction/`: os cenários pela API — contrato, fatos, cada métrica, Receita, Modo Rua, 2FA, herança e concorrência. Em `test_rule_edges.py`, cada limiar testado na borda (R$ 1.000 contra R$ 1.000,01, 29 contra 30 dias, nota 40 e nota 70), a mediana do ticket e a resposta que não expõe IP, aparelho nem documento.
 - `tests/integration/test_input_robustness.py`: entrada torta de todo tipo. Nenhuma pode virar 500:
   - **corpo:** o que não é JSON, JSON em UTF-16 ou com BOM, bytes que não são UTF-8, megabytes de espaço, 100 mil campos extras, corpo em chunks;
   - **campos:** tipos errados, números com 5.000 dígitos, NaN e infinito, inteiro escrito como `5000.0`, surrogate solto, caracteres de controle;
