@@ -35,6 +35,13 @@ services:
       # A senha que protege os endpoints internos. O padrao vale pra
       # estudar; num sistema de verdade, isso nunca teria valor padrao.
       INTERNAL_TOKEN: ${INTERNAL_TOKEN:-default_token}
+      # A Receita Federal, consultada sobre quem recebe o Pix. Dentro do
+      # compose ela e o mock "receita", logo abaixo. RECEITA_ENABLED=false
+      # no .env desliga a consulta, e o motor roda sem ela.
+      RECEITA_ENABLED: ${RECEITA_ENABLED:-true}
+      RECEITA_API_URL: http://receita:8080
+      RECEITA_API_TIMEOUT: ${RECEITA_API_TIMEOUT:-0.5}
+      RECEITA_CACHE_HOURS: ${RECEITA_CACHE_HOURS:-24}
     volumes:
       # Monta o codigo pra dentro do container: salvou o arquivo,
       # a API recarrega sozinha (o --reload ali embaixo).
@@ -51,9 +58,22 @@ services:
       timeout: 5s
       retries: 20
       start_period: 5s
+    # A API depende so do banco. Ela NAO espera a Receita: se o mock
+    # estiver fora do ar, o motor segue sem a consulta, como seguiria com
+    # a Receita de verdade fora do ar.
     depends_on:
       db:
         condition: service_healthy
+
+  # O mock da Receita Federal (mocks/receita/app.py). A resposta sai do
+  # prefixo do documento — a tabela de prefixos esta no proprio arquivo.
+  receita:
+    build: ./mocks/receita/.
+    healthcheck:
+      test: ["CMD-SHELL", "python -c 'import urllib.request; urllib.request.urlopen(\"http://localhost:8080/health_check\")'"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
 
   db:
     build: ./database/.
@@ -94,5 +114,8 @@ services:
       api:
         condition: service_healthy
       db:
+        condition: service_healthy
+      # Os testes da Receita precisam do mock de pe; a API, nao.
+      receita:
         condition: service_healthy
 

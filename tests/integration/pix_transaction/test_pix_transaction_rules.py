@@ -1,13 +1,34 @@
 from datetime import timedelta
 
-from tests.utils import DAYTIME, NIGHTTIME, ObjectGenerator, PayloadGenerator, RandomGenerator, RequestGenerator
+from tests.utils import (
+    DAYTIME,
+    GUARULHOS,
+    NIGHTTIME,
+    SALVADOR,
+    ObjectGenerator,
+    PayloadGenerator,
+    RandomGenerator,
+    RequestGenerator,
+)
 
 RESTRICTED_DOCUMENT = "529.982.247-25"  # está no seed de restricted_party do database.sql
 
 
-class TestBlockingRules:
+def build_history(payer: str, destination: dict, days: int, amount: int = 10000) -> None:
+    """Um cliente com rotina: um Pix por dia, às 14h, de São Paulo, para o mesmo destino."""
+    for days_ago in range(days, 0, -1):
+        ObjectGenerator.send_pix(
+            payer_document=payer,
+            destination=destination,
+            amount=amount,
+            transaction_date=DAYTIME - timedelta(days=days_ago),
+        )
+
+
+class TestFacts:
+    """Fatos não são métricas: reprovam direto, e o Pix fica gravado com o motivo."""
+
     def test_invalid_document_is_rejected_and_recorded(self):
-        """Documento que não existe não vira 4xx: o Pix é reprovado e fica gravado e consultável."""
         destination = PayloadGenerator.create_destination(document_number="111.222.333-44")
 
         analysis = ObjectGenerator.send_pix(destination=destination)
@@ -15,9 +36,16 @@ class TestBlockingRules:
         assert analysis["status"] == "rejected"
         assert ObjectGenerator.decision(analysis)["reason"] == "blocking_rule"
         assert ObjectGenerator.decision(analysis)["rules"] == ["invalid_document_number"]
+        # Documento impossível nem é perguntado à Receita
+        assert analysis["metadata"]["receita"]["source"] == "skipped"
+
+    def test_restricted_payer_is_rejected(self):
+        analysis = ObjectGenerator.send_pix(payer_document=RESTRICTED_DOCUMENT)
+
+        assert analysis["status"] == "rejected"
+        assert ObjectGenerator.decision(analysis)["rules"] == ["restricted_payer"]
 
     def test_rejected_pix_is_recorded_with_the_reason(self):
-        """O Pix barrado fica gravado, e o GET diz por que ele foi barrado."""
         destination = PayloadGenerator.create_destination(document_number=RESTRICTED_DOCUMENT)
 
         analysis = ObjectGenerator.send_pix(destination=destination)
@@ -28,59 +56,213 @@ class TestBlockingRules:
         assert ObjectGenerator.decision(saved) == {
             "reason": "blocking_rule",
             "rules": ["restricted_destination"],
-            "description": "Reprovado por regra de bloqueio: Quem recebe está na lista restritiva",
+            "description": "Reprovado por um fato: Quem recebe está na lista restritiva",
         }
 
-    def test_silver_over_daily_limit_is_rejected_but_gold_is_not(self):
-        silver = ObjectGenerator.send_pix(amount=150000, level="silver")
-        gold = ObjectGenerator.send_pix(amount=150000, level="gold")
 
-        assert silver["status"] == "rejected"
-        assert "silver_daily_limit_exceeded" in ObjectGenerator.fired_rules(silver)
+class TestReceita:
+    """A Receita Federal, sobre quem recebe. O mock responde pelo prefixo do documento."""
 
-        # O Ouro não tem teto; o 2FA dele vem de ser o primeiro Pix (falta de dado).
-        assert gold["status"] == "two_factor_required"
-        assert ObjectGenerator.fired_rules(gold) == ["payer_without_history"]
+    def send_to(self, prefix: str, **payload_fields) -> dict:
+        destination = PayloadGenerator.create_destination(document_number=RandomGenerator.generate_cpf(prefix))
+        return ObjectGenerator.send_pix(destination=destination, **payload_fields)
+
+    def test_deceased_or_inexistent_receiver_is_rejected(self):
+        for prefix, situation in [("001", "deceased"), ("002", "canceled"), ("003", "nullified"), ("000", "not_found")]:
+            analysis = self.send_to(prefix)
+
+            assert analysis["status"] == "rejected", situation
+            assert ObjectGenerator.decision(analysis)["rules"] == ["receita_destination_blocked"], situation
+            assert analysis["metadata"]["receita"] == {"source": "api", "situation": situation}
+
+    def test_suspended_receiver_only_weighs(self):
+        """Suspenso é sinal de destino, não fato: sozinho, não decide."""
+        analysis = self.send_to("004")
+
+        assert analysis["status"] == "approved"
+        assert "receita_destination_irregular" in ObjectGenerator.fired_rules(analysis)
+        assert ObjectGenerator.metric_points(analysis)["destination"] == 15
+
+    def test_receita_down_never_rejects(self):
+        """Lenta, fora do ar ou com resposta quebrada: o Pix segue, e a falha fica no metadata."""
+        for prefix, error in [("006", "timeout"), ("007", "http_500"), ("008", "malformed_response")]:
+            analysis = self.send_to(prefix)
+
+            assert analysis["status"] == "approved", error
+            assert analysis["metadata"]["receita"] == {"source": "unavailable", "situation": None, "error": error}
+
+    def test_second_pix_to_the_same_receiver_uses_the_cache(self):
+        destination = PayloadGenerator.create_destination()
+
+        first = ObjectGenerator.send_pix(destination=destination)
+        second = ObjectGenerator.send_pix(destination=destination, transaction_date=DAYTIME + timedelta(minutes=30))
+
+        assert first["metadata"]["receita"]["source"] == "api"
+        assert second["metadata"]["receita"] == {"source": "cache", "situation": "regular"}
+
+
+class TestHour:
+    """O horário comparado com o costume do próprio cliente. É a métrica que mais pesa."""
+
+    def test_unusual_hour_alone_does_not_decide(self):
+        payer = RandomGenerator.generate_cpf()
+        rent = PayloadGenerator.create_destination()
+        build_history(payer, rent, days=5)
+
+        at_three_am = ObjectGenerator.send_pix(
+            payer_document=payer, destination=rent, transaction_date=DAYTIME.replace(hour=3)
+        )
+
+        assert "unusual_hour" in ObjectGenerator.fired_rules(at_three_am)
+        assert ObjectGenerator.metric_points(at_three_am)["hour"] == 35
+        assert at_three_am["status"] == "approved"
+
+    def test_unusual_hour_plus_a_new_account_asks_two_factor(self):
+        payer = RandomGenerator.generate_cpf()
+        build_history(payer, PayloadGenerator.create_destination(), days=5)
+        brand_new_account = PayloadGenerator.create_destination(opening_date=DAYTIME - timedelta(days=3))
+
+        analysis = ObjectGenerator.send_pix(
+            payer_document=payer, destination=brand_new_account, transaction_date=DAYTIME.replace(hour=3)
+        )
+
+        # horário 35 + destino 15 = 50
+        assert ObjectGenerator.risk(analysis)["transaction_risk"] == 50
+        assert analysis["status"] == "two_factor_required"
 
 
 class TestStreetMode:
-    """O Modo Rua: o app avisa que o celular saiu das redes Wi-Fi que o cliente cadastrou."""
+    """O Modo Rua virou a métrica de local: longe de todos os lugares de costume, pesa 25."""
 
-    def test_without_limit_every_pix_asks_two_factor(self):
-        analysis = ObjectGenerator.send_pix(amount=1000, street_mode={"active": True})
+    def test_far_alone_does_not_stop_the_traveler(self):
+        payer = RandomGenerator.generate_cpf()
 
+        ObjectGenerator.send_pix(payer_document=payer)  # aprovado em São Paulo
+        in_salvador = ObjectGenerator.send_pix(
+            payer_document=payer, geolocation=SALVADOR, transaction_date=DAYTIME + timedelta(hours=3)
+        )
+
+        assert "far_from_usual_places" in ObjectGenerator.fired_rules(in_salvador)
+        assert ObjectGenerator.metric_points(in_salvador)["location"] == 25
+        assert in_salvador["status"] == "approved"
+
+    def test_far_and_at_night_asks_two_factor(self):
+        """O exemplo do Modo Rua: à noite, num lugar muito longe."""
+        payer = RandomGenerator.generate_cpf()
+
+        ObjectGenerator.send_pix(payer_document=payer)  # São Paulo, de dia
+        far_at_night = ObjectGenerator.send_pix(payer_document=payer, geolocation=SALVADOR, transaction_date=NIGHTTIME)
+
+        # horário (noite, sem histórico de horários) 20 + local 25 + destino 5 = 50
+        assert ObjectGenerator.metric_points(far_at_night)["hour"] == 20
+        assert ObjectGenerator.metric_points(far_at_night)["location"] == 25
+        assert far_at_night["status"] == "two_factor_required"
+
+    def test_inside_the_radius_changes_nothing(self):
+        payer = RandomGenerator.generate_cpf()
+
+        ObjectGenerator.send_pix(payer_document=payer)
+        in_guarulhos = ObjectGenerator.send_pix(
+            payer_document=payer, geolocation=GUARULHOS, transaction_date=DAYTIME + timedelta(hours=1)
+        )
+
+        assert "far_from_usual_places" not in ObjectGenerator.fired_rules(in_guarulhos)
+
+    def test_without_geolocation_there_is_nothing_to_compare(self):
+        payer = RandomGenerator.generate_cpf()
+
+        ObjectGenerator.send_pix(payer_document=payer)
+        no_location = ObjectGenerator.send_pix(
+            payer_document=payer, geolocation=None, transaction_date=DAYTIME + timedelta(hours=1)
+        )
+
+        assert "far_from_usual_places" not in ObjectGenerator.fired_rules(no_location)
+
+    def test_the_traveler_confirms_once_and_the_city_becomes_usual(self):
+        payer = RandomGenerator.generate_cpf()
+
+        ObjectGenerator.send_pix(payer_document=payer)  # São Paulo
+        first_in_salvador = ObjectGenerator.send_pix(payer_document=payer, geolocation=SALVADOR, transaction_date=NIGHTTIME)
+        RequestGenerator.POST_two_factor(first_in_salvador["pix_id"], {"result": "confirmed"})
+
+        next_day = ObjectGenerator.send_pix(
+            payer_document=payer, geolocation=SALVADOR, transaction_date=NIGHTTIME + timedelta(hours=14)
+        )
+
+        assert first_in_salvador["status"] == "two_factor_required"
+        assert "far_from_usual_places" not in ObjectGenerator.fired_rules(next_day)
+
+    def test_unconfirmed_pix_never_teaches_a_place(self):
+        """O Pix do ladrão (2FA pendente) não pode transformar o lugar dele em "de costume"."""
+        payer = RandomGenerator.generate_cpf()
+
+        ObjectGenerator.send_pix(payer_document=payer)  # São Paulo
+        ObjectGenerator.send_pix(payer_document=payer, geolocation=SALVADOR, transaction_date=NIGHTTIME)
+        again_in_salvador = ObjectGenerator.send_pix(
+            payer_document=payer, geolocation=SALVADOR, transaction_date=NIGHTTIME + timedelta(hours=1)
+        )
+
+        assert "far_from_usual_places" in ObjectGenerator.fired_rules(again_in_salvador)
+
+
+class TestAmountAndDestination:
+    def test_high_amount_to_known_destination_is_approved(self):
+        """A tese: R$ 5.000 para o destino de sempre é o aluguel. Valor alto sozinho não decide."""
+        payer = RandomGenerator.generate_cpf()
+        rent = PayloadGenerator.create_destination()
+        build_history(payer, rent, days=3, amount=50000)
+
+        to_rent = ObjectGenerator.send_pix(payer_document=payer, destination=rent, amount=500000)
+
+        assert ObjectGenerator.metric_points(to_rent)["amount"] == 30
+        assert to_rent["status"] == "approved"
+
+    def test_high_amount_to_a_brand_new_account_asks_two_factor(self):
+        """O golpe clássico: valor alto para uma conta aberta há dias."""
+        payer = RandomGenerator.generate_cpf()
+        build_history(payer, PayloadGenerator.create_destination(), days=3, amount=50000)
+        brand_new_account = PayloadGenerator.create_destination(opening_date=DAYTIME - timedelta(days=5))
+
+        analysis = ObjectGenerator.send_pix(payer_document=payer, destination=brand_new_account, amount=500000)
+
+        # valor 30 + destino 15 = 45
+        assert ObjectGenerator.risk(analysis)["transaction_risk"] == 45
         assert analysis["status"] == "two_factor_required"
-        assert ObjectGenerator.decision(analysis)["reason"] == "two_factor_rule"
-        assert ObjectGenerator.decision(analysis)["rules"] == ["street_mode"]
-        # Fricção, não comportamento suspeito: não soma ponto
-        assert analysis["metadata"]["risk_score"] == 0
 
-    def test_with_limit_only_above_it_asks_two_factor(self):
-        street_mode = {"active": True, "limit": 10000}
+    def test_destination_receiving_from_many_payers(self):
+        """Conta laranja: cinco pagadores diferentes na mesma conta em poucas horas."""
+        destination = PayloadGenerator.create_destination()
 
-        below = ObjectGenerator.send_pix(amount=10000, street_mode=street_mode)
-        above = ObjectGenerator.send_pix(amount=10001, street_mode=street_mode)
+        analyses = []
+        for minute in range(5):
+            analyses.append(
+                ObjectGenerator.send_pix(destination=destination, transaction_date=DAYTIME + timedelta(minutes=minute))
+            )
 
-        assert below["status"] == "approved"
-        assert above["status"] == "two_factor_required"
-        assert "street_mode" in ObjectGenerator.fired_rules(above)
-
-    def test_inactive_or_absent_changes_nothing(self):
-        at_home = ObjectGenerator.send_pix(amount=10000, street_mode={"active": False})
-        not_informed = ObjectGenerator.send_pix(amount=10000)
-
-        assert at_home["status"] == "approved"
-        assert not_informed["status"] == "approved"
-
-    def test_street_mode_never_saves_a_rejected_pix(self):
-        destination = PayloadGenerator.create_destination(document_number=RESTRICTED_DOCUMENT)
-
-        analysis = ObjectGenerator.send_pix(destination=destination, street_mode={"active": True})
-
-        assert analysis["status"] == "rejected"
+        assert "destination_many_payers" not in ObjectGenerator.fired_rules(analyses[3])
+        assert "destination_many_payers" in ObjectGenerator.fired_rules(analyses[4])
 
 
-class TestOneDevicePerAccount:
+class TestVelocity:
+    def test_burst_of_small_pix(self):
+        """O ladrão com pressa: valores pequenos, um atrás do outro."""
+        payer = RandomGenerator.generate_cpf()
+        destination = PayloadGenerator.create_destination()
+
+        analyses = []
+        for minute in range(4):
+            analyses.append(
+                ObjectGenerator.send_pix(
+                    payer_document=payer, destination=destination, transaction_date=DAYTIME + timedelta(minutes=minute)
+                )
+            )
+
+        assert "burst_3_in_10_minutes" in ObjectGenerator.fired_rules(analyses[2])
+        assert "burst_4_in_10_minutes" in ObjectGenerator.fired_rules(analyses[3])
+        assert ObjectGenerator.metric_points(analyses[3])["velocity"] == 20
+
+
+class TestOrigin:
     """Premissa do projeto: um aparelho por conta e uma conta por aparelho."""
 
     def test_device_change_weighs_for_the_next_hours(self):
@@ -103,94 +285,66 @@ class TestOneDevicePerAccount:
         assert "device_changed" in ObjectGenerator.fired_rules(same_day)
         assert "device_changed" not in ObjectGenerator.fired_rules(two_days_later)
 
-    def test_same_device_on_another_account(self):
+    def test_same_device_or_ip_on_another_account(self):
         device_id = f"celular-{RandomGenerator.generate_cpf()}"
+        ip = "203.0.113.77"
 
-        first_owner = ObjectGenerator.send_pix(device_id=device_id)
-        second_account = ObjectGenerator.send_pix(device_id=device_id, transaction_date=DAYTIME + timedelta(hours=1))
+        ObjectGenerator.send_pix(device_id=device_id, ip=ip)
+        second_account = ObjectGenerator.send_pix(
+            device_id=device_id, ip=ip, transaction_date=DAYTIME + timedelta(hours=1)
+        )
 
-        assert "device_shared" not in ObjectGenerator.fired_rules(first_owner)
         assert "device_shared" in ObjectGenerator.fired_rules(second_account)
-        assert second_account["status"] == "two_factor_required"
+        assert "ip_shared" in ObjectGenerator.fired_rules(second_account)
+        # aparelho e IP somam 20, mas a origem para no teto de 10
+        assert ObjectGenerator.metric_points(second_account)["origin"] == 10
+        assert second_account["status"] == "approved"
 
 
-class TestScore:
-    def test_splitting_below_night_limit_climbs_to_rejected(self):
-        """Fracionamento: R$ 900 à noite, um atrás do outro, cada um para uma conta nova.
+class TestMemory:
+    """O risco tem prazo de validade: 24 horas, e a herança depende do que aconteceu no 2FA."""
 
-        Nenhum Pix sozinho passa do limite noturno. É o padrão que pontua,
-        e o score sobe Pix a Pix até reprovar.
-        """
+    def test_unanswered_risk_passes_half_to_the_next_pix(self):
         payer = RandomGenerator.generate_cpf()
 
-        results = []
-        for minute in range(6):
-            analysis = ObjectGenerator.send_pix(
-                payer_document=payer,
-                amount=90000,
-                transaction_date=NIGHTTIME + timedelta(minutes=minute),
-            )
-            results.append((analysis["status"], analysis["metadata"]["risk_score"]))
+        first = ObjectGenerator.send_two_factor_pix(payer_document=payer)
+        next_pix = ObjectGenerator.send_pix(payer_document=payer, transaction_date=NIGHTTIME + timedelta(hours=1))
 
-        # O reprovado diz que foi o score, e quais regras deste Pix o levaram a 5.
-        assert ObjectGenerator.decision(analysis)["reason"] == "risk_score"
-        assert ObjectGenerator.decision(analysis)["rules"] == ["many_new_destinations", "split_below_night_limit"]
+        assert ObjectGenerator.risk(next_pix)["inherited_risk"] == 25
+        assert ObjectGenerator.risk(next_pix)["inherited_from_pix_id"] == first["pix_id"]
 
-        assert results == [
-            ("two_factor_required", 0),  # primeiro Pix: falta de dado, não ponto
-            ("two_factor_required", 0),  # o dia passou de R$ 1.000 sem nível informado
-            ("two_factor_required", 2),  # 3º Pix logo abaixo do limite: +2
-            ("two_factor_required", 4),  # 4º: +2
-            ("rejected", 5),  # 5º: fracionamento +2 e 5 destinos novos +2
-            ("rejected", 5),
-        ]
-
-    def test_high_amount_to_known_destination_is_approved(self):
-        """A tese: R$ 5.000 para o destino de sempre é o aluguel. Para um destino novo, é dúvida."""
+    def test_the_insistent_thief_is_rejected(self):
+        """Falhou na selfie e tentou de novo: o risco anterior passa inteiro, e o Pix é reprovado."""
         payer = RandomGenerator.generate_cpf()
-        rent = PayloadGenerator.create_destination()
 
-        for days_ago in [3, 2, 1]:
-            ObjectGenerator.send_pix(
-                payer_document=payer, level="gold", destination=rent, amount=50000,
-                transaction_date=DAYTIME - timedelta(days=days_ago),
-            )
+        first = ObjectGenerator.send_two_factor_pix(payer_document=payer)
+        RequestGenerator.POST_two_factor(first["pix_id"], {"result": "failed"})
 
-        to_rent = ObjectGenerator.send_pix(payer_document=payer, level="gold", destination=rent, amount=500000)
-        to_stranger = ObjectGenerator.send_pix(
-            payer_document=payer, level="gold", amount=900000, transaction_date=DAYTIME + timedelta(minutes=5)
+        retry = ObjectGenerator.send_pix(
+            payer_document=payer,
+            amount=150000,
+            transaction_date=NIGHTTIME + timedelta(minutes=5),
+            destination=PayloadGenerator.create_destination(opening_date=NIGHTTIME - timedelta(days=7)),
         )
 
-        assert to_rent["status"] == "approved"
-        assert "amount_above_profile" not in ObjectGenerator.fired_rules(to_rent)
+        # risco deste Pix 50 + herdado 50 = 100
+        assert ObjectGenerator.risk(retry)["inherited_risk"] == 50
+        assert retry["status"] == "rejected"
 
-        assert to_stranger["status"] == "two_factor_required"
-        assert "amount_above_profile" in ObjectGenerator.fired_rules(to_stranger)
-
-    def test_points_expire_after_seven_days(self):
+    def test_confirmed_two_factor_leaves_no_risk_behind(self):
         payer = RandomGenerator.generate_cpf()
 
-        # Fracionamento até o 5º Pix, que reprova.
-        for minute in range(5):
-            ObjectGenerator.send_pix(payer_document=payer, amount=90000, transaction_date=NIGHTTIME + timedelta(minutes=minute))
+        first = ObjectGenerator.send_two_factor_pix(payer_document=payer)
+        RequestGenerator.POST_two_factor(first["pix_id"], {"result": "confirmed"})
 
-        a_week_later = ObjectGenerator.send_pix(
-            payer_document=payer, amount=5000, transaction_date=DAYTIME + timedelta(days=8)
-        )
+        next_pix = ObjectGenerator.send_pix(payer_document=payer, transaction_date=NIGHTTIME + timedelta(hours=1))
 
-        assert a_week_later["metadata"]["score"]["previous_points"] == 0
-        assert a_week_later["status"] == "approved"
+        assert ObjectGenerator.risk(next_pix)["inherited_risk"] == 0
 
-    def test_destination_receiving_from_many_payers(self):
-        """Conta laranja: cinco pagadores diferentes na mesma conta em poucas horas."""
-        destination = PayloadGenerator.create_destination()
+    def test_risk_expires_after_24_hours(self):
+        payer = RandomGenerator.generate_cpf()
 
-        analyses = []
-        for minute in range(5):
-            analyses.append(
-                ObjectGenerator.send_pix(destination=destination, transaction_date=DAYTIME + timedelta(minutes=minute))
-            )
+        ObjectGenerator.send_two_factor_pix(payer_document=payer)
+        a_day_later = ObjectGenerator.send_pix(payer_document=payer, transaction_date=NIGHTTIME + timedelta(hours=25))
 
-        assert "destination_many_payers" not in ObjectGenerator.fired_rules(analyses[3])
-        assert "destination_many_payers" in ObjectGenerator.fired_rules(analyses[4])
-        assert analyses[4]["status"] == "two_factor_required"
+        assert ObjectGenerator.risk(a_day_later)["inherited_risk"] == 0

@@ -15,6 +15,14 @@ NIGHTTIME = datetime(2026, 10, 14, 22, 15, tzinfo=BRASILIA)
 
 ITAU_ISPB = "60701190"
 
+# Lugares para o Modo Rua. Guarulhos fica a ~17 km do centro de São
+# Paulo (dentro do raio de 30 km); Campinas, a ~85 km; Salvador, a
+# ~1.450 km.
+SAO_PAULO = {"latitude": -23.56, "longitude": -46.65}
+GUARULHOS = {"latitude": -23.45, "longitude": -46.53}
+CAMPINAS = {"latitude": -22.91, "longitude": -47.06}
+SALVADOR = {"latitude": -12.97, "longitude": -38.50}
+
 
 def to_iso(moment: datetime) -> str:
     return moment.isoformat()
@@ -48,22 +56,25 @@ class PayloadGenerator:
         transaction_date: datetime = None,
         payer_document: str = None,
         destination: dict = None,
-        level: str = None,
         device_id: str = None,
-        street_mode: dict = None,
+        ip: str = None,
+        geolocation: dict = SAO_PAULO,
         pix_id: str = None,
     ) -> dict:
         """Um Pix válido, com qualquer campo trocado a pedido.
 
         Sem argumento nenhum o pagador é um CPF aleatório: cada teste
         começa com um pagador sem histórico, e um teste não contamina o
-        score do outro. Quem testa histórico passa o MESMO pagador nos
+        risco do outro. Quem testa histórico passa o MESMO pagador nos
         vários Pix.
 
-        O aparelho, por padrão, nasce do CPF do pagador: um aparelho por
-        conta, como na premissa do projeto. Um aparelho fixo para todos
-        os testes faria a regra de aparelho compartilhado disparar em
-        todos eles.
+        O aparelho e o IP, por padrão, nascem do CPF do pagador: um
+        aparelho por conta, como na premissa do projeto. Um aparelho ou
+        um IP fixo para todos os testes faria a métrica de origem pesar
+        em todos eles.
+
+        A geolocalização é São Paulo por padrão. `geolocation=None` manda
+        o Pix sem ela, como o contrato permite.
         """
         if transaction_date is None:
             transaction_date = DAYTIME
@@ -74,24 +85,27 @@ class PayloadGenerator:
         if destination is None:
             destination = PayloadGenerator.create_destination()
 
+        payer_digits = "".join(character for character in payer_document if character.isdigit())
+
         if device_id is None:
-            device_id = f"dvc-{''.join(character for character in payer_document if character.isdigit())}"
+            device_id = f"dvc-{payer_digits}"
+
+        if ip is None:
+            number = int(payer_digits)
+            ip = f"10.{number // 65536 % 256}.{number // 256 % 256}.{number % 256}"
 
         if pix_id is None:
             pix_id = f"pix-{uuid4()}"
 
         owner = {"document_number": payer_document}
-        if level is not None:
-            owner["level"] = level
 
         source = {
             "device_id": device_id,
             "channel": "app",
-            "ip": "198.51.100.23",
-            "geolocation": {"latitude": -23.56, "longitude": -46.65},
+            "ip": ip,
         }
-        if street_mode is not None:
-            source["street_mode"] = street_mode
+        if geolocation is not None:
+            source["geolocation"] = dict(geolocation)
 
         return {
             "id": pix_id,

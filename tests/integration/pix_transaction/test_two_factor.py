@@ -1,27 +1,66 @@
-from datetime import timedelta
+from datetime import datetime, timedelta
 
-from tests.utils import DAYTIME, NIGHTTIME, ObjectGenerator, PayloadGenerator, RandomGenerator, RequestGenerator
+from tests.utils import NIGHTTIME, DbUtils, ObjectGenerator, RandomGenerator, RequestGenerator
 
 
 class TestTwoFactor:
     """O banco avisa o que o cliente fez com o 2FA. A decisão do motor nunca muda."""
 
-    def test_confirmed_two_factor_is_recorded_beside_the_decision(self):
-        analysis = ObjectGenerator.send_pix(amount=50000)
-        assert analysis["status"] == "two_factor_required"
+    def test_two_factor_is_born_pending_with_a_deadline(self):
+        """O 2FA pedido já nasce como pendência, com prazo de 3 minutos, visível no POST e no GET."""
+        analysis = ObjectGenerator.send_two_factor_pix()
+        approved = ObjectGenerator.send_pix(amount=5000)
+
+        two_factor = analysis["metadata"]["two_factor"]
+        received_at = datetime.fromisoformat(analysis["metadata"]["arrival"]["received_at"])
+
+        assert two_factor["result"] == "pending"
+        assert two_factor["resolved_at"] is None
+        assert datetime.fromisoformat(two_factor["expires_at"]) - received_at == timedelta(minutes=3)
+
+        status, saved = RequestGenerator.GET_pix_transaction(analysis["pix_id"])
+        assert saved["metadata"]["two_factor"]["result"] == "pending"
+
+        # Pix que não pediu 2FA não tem pendência nenhuma
+        assert approved["status"] == "approved"
+        assert "two_factor" not in approved["metadata"]
+
+    def test_confirmed_two_factor_closes_the_pending(self):
+        analysis = ObjectGenerator.send_two_factor_pix()
 
         status, response = RequestGenerator.POST_two_factor(analysis["pix_id"], {"result": "confirmed"})
 
         assert status == 201
         assert response["status"] == "two_factor_required"
         assert response["metadata"]["two_factor"]["result"] == "confirmed"
+        assert response["metadata"]["two_factor"]["resolved_at"] is not None
 
         status, response = RequestGenerator.GET_pix_transaction(analysis["pix_id"])
         assert response["key"] == analysis["key"]
         assert response["metadata"]["two_factor"]["result"] == "confirmed"
 
+    def test_answer_after_the_deadline_is_refused(self):
+        """A selfie chegou tarde: a pendência fecha como expirada, e o Pix não sai."""
+        analysis = ObjectGenerator.send_two_factor_pix()
+        DbUtils.expire_two_factor(analysis["pix_id"])
+
+        status, response = RequestGenerator.POST_two_factor(analysis["pix_id"], {"result": "confirmed"})
+
+        assert status == 409
+        assert response["code"] == "QIT002006"
+
+        status, saved = RequestGenerator.GET_pix_transaction(analysis["pix_id"])
+        assert saved["status"] == "two_factor_required"
+        assert saved["metadata"]["two_factor"]["result"] == "expired"
+        assert saved["metadata"]["two_factor"]["resolved_at"] is not None
+
+        # Insistir depois de expirado continua recusado, com o mesmo motivo
+        status, response = RequestGenerator.POST_two_factor(analysis["pix_id"], {"result": "confirmed"})
+        assert status == 409
+        assert response["code"] == "QIT002006"
+
     def test_answering_twice_is_409(self):
-        analysis = ObjectGenerator.send_pix(amount=50000)
+        analysis = ObjectGenerator.send_two_factor_pix()
         RequestGenerator.POST_two_factor(analysis["pix_id"], {"result": "confirmed"})
 
         status, response = RequestGenerator.POST_two_factor(analysis["pix_id"], {"result": "failed"})
@@ -45,40 +84,33 @@ class TestTwoFactor:
         assert response["code"] == "QIT002002"
 
     def test_schema_refuses_other_results(self):
-        analysis = ObjectGenerator.send_pix(amount=50000)
+        analysis = ObjectGenerator.send_two_factor_pix()
 
         status, response = RequestGenerator.POST_two_factor(analysis["pix_id"], {"result": "maybe"})
 
         assert status == 400
         assert response["code"] == "QIT000001"
 
-    def test_failed_two_factor_raises_the_next_pix(self):
-        """Celular roubado: o golpista tem a senha, mas não a biometria."""
+    def test_failed_two_factor_passes_the_whole_risk_on(self):
+        """Celular roubado: o golpista tem a senha, mas não o rosto. A dúvida virou suspeita."""
         payer = RandomGenerator.generate_cpf()
-        first = ObjectGenerator.send_pix(payer_document=payer, amount=50000)
+        first = ObjectGenerator.send_two_factor_pix(payer_document=payer)
         RequestGenerator.POST_two_factor(first["pix_id"], {"result": "failed"})
 
-        next_pix = ObjectGenerator.send_pix(payer_document=payer, amount=5000, transaction_date=DAYTIME + timedelta(hours=1))
+        next_pix = ObjectGenerator.send_pix(payer_document=payer, transaction_date=NIGHTTIME + timedelta(hours=1))
 
-        assert "two_factor_failed_recently" in ObjectGenerator.fired_rules(next_pix)
-        assert next_pix["status"] == "two_factor_required"
+        # herda os 50 inteiros: noite sem histórico 20 + destino 5 + 50 = 75
+        assert ObjectGenerator.risk(next_pix)["inherited_risk"] == 50
+        assert ObjectGenerator.risk(next_pix)["inherited_fraction"] == 1.0
+        assert next_pix["status"] == "rejected"
 
     def test_confirmed_two_factor_clears_the_doubt(self):
-        """Pontos de um Pix com 2FA confirmado saem do score: a dúvida foi tirada pelo cliente."""
+        """2FA confirmado: a dúvida foi tirada pelo cliente, e o risco daquele Pix não passa adiante."""
         payer = RandomGenerator.generate_cpf()
-        new_account = PayloadGenerator.create_destination(opening_date=NIGHTTIME - timedelta(days=10))
-
-        first = ObjectGenerator.send_pix(
-            payer_document=payer, level="gold", destination=new_account, amount=150000, transaction_date=NIGHTTIME
-        )
-        assert first["metadata"]["risk_score"] == 3
-
+        first = ObjectGenerator.send_two_factor_pix(payer_document=payer)
         RequestGenerator.POST_two_factor(first["pix_id"], {"result": "confirmed"})
 
-        second = ObjectGenerator.send_pix(
-            payer_document=payer, level="gold", destination=new_account, amount=5000,
-            transaction_date=NIGHTTIME + timedelta(hours=12),
-        )
+        next_pix = ObjectGenerator.send_pix(payer_document=payer, transaction_date=NIGHTTIME + timedelta(hours=12))
 
-        assert second["metadata"]["score"]["previous_points"] == 0
-        assert second["status"] == "approved"
+        assert ObjectGenerator.risk(next_pix)["inherited_risk"] == 0
+        assert next_pix["status"] == "approved"

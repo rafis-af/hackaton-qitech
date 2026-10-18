@@ -14,6 +14,27 @@ SERVICE_NAME = os.environ.get("SERVICE_NAME", "antifraude-pix-api")
 DATABASE_URL = os.environ.get("DATABASE_URL")
 INTERNAL_TOKEN = os.environ.get("INTERNAL_TOKEN")
 
+# A Receita Federal: o único serviço de fora que o antifraude consulta,
+# sobre quem RECEBE o Pix. Na sua máquina, quem responde é o mock em
+# mocks/receita/ (sobe junto no docker compose).
+#
+# RECEITA_ENABLED=false desliga a consulta inteira: o motor roda igual,
+# só sem as duas regras da Receita. É o que deixa o projeto de pé mesmo
+# sem o container do mock.
+RECEITA_ENABLED = os.environ.get("RECEITA_ENABLED", "true").lower() == "true"
+RECEITA_API_URL = os.environ.get("RECEITA_API_URL", "http://localhost:8080")
+RECEITA_API_INTERNAL_TOKEN = os.environ.get("RECEITA_API_INTERNAL_TOKEN", "default_token")
+
+# Segundos. Curto de propósito: o cliente está esperando o Pix sair, e a
+# decisão não pode ficar pendurada na rede. Passou disso, o motor segue
+# sem a resposta da Receita.
+RECEITA_API_TIMEOUT = float(os.environ.get("RECEITA_API_TIMEOUT", "0.5"))
+
+# Quanto tempo uma resposta da Receita vale no cache (document_situation).
+# Situação cadastral muda raramente; um dia evita consultar a Receita a
+# cada Pix para o mesmo destino.
+RECEITA_CACHE_HOURS = int(os.environ.get("RECEITA_CACHE_HOURS", "24"))
+
 # Rotas públicas: não exigem o header INTERNAL-TOKEN. São as duas que
 # precisam responder pra quem ainda não tem token nenhum: a raiz, que
 # diz quem é este serviço, e o health check, que o Docker consulta pra

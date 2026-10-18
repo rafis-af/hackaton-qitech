@@ -55,6 +55,25 @@ class TwoFactorAlreadyAnswered(QIException):
         super().__init__(title, self.code, http_status, description, translation)
 
 
+class TwoFactorExpired(QIException):
+    """A resposta do 2FA chegou depois do prazo.
+
+    409, e não 400: o pedido está bem escrito (400 é "não consegui ler o
+    seu pedido", como diz o Base Service). O que impede é o estado da
+    pendência, que já fechou — a mesma família dos outros dois erros de
+    2FA aqui em cima.
+    """
+
+    code = "QIT002006"
+
+    def __init__(self, pix_id, expires_at) -> None:
+        title = "Two factor expired"
+        http_status = 409
+        description = f"The two factor of Pix {pix_id} expired at {expires_at}."
+        translation = f"O prazo do 2FA do Pix {pix_id} acabou em {expires_at}: o Pix não pode mais ser confirmado."
+        super().__init__(title, self.code, http_status, description, translation)
+
+
 class InvalidDateTime(QIException):
     """A data tem o formato certo e não existe no calendário.
 

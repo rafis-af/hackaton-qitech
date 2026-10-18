@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Optional
+from typing import List, Optional, Tuple
 
 from sqlalchemy import and_, func, or_, text
 
@@ -12,10 +12,11 @@ SAO_PAULO_TIMEZONE = "America/Sao_Paulo"
 class PixTransactionRepository:
     """O histórico de tudo que chegou. Só aqui existe consulta sobre Pix.
 
-    Nenhuma regra mora aqui: estas consultas devolvem NÚMEROS ("quantos
-    destinos novos em 24 horas"), e quem decide se o número é suspeito é
-    o src/controllers/risk_rules.py. Os limiares chegam por parâmetro
-    justamente para que nenhum deles fique escondido numa consulta.
+    Nenhuma regra mora aqui: estas consultas devolvem NÚMEROS ("quantos Pix
+    o cliente fez nesta faixa de horário"), e quem decide se o número é
+    suspeito é o src/controllers/risk_rules.py. As janelas e as faixas
+    chegam por parâmetro justamente para que nenhum limiar fique escondido
+    numa consulta.
     """
 
     def __init__(self, context: Context) -> None:
@@ -36,9 +37,9 @@ class PixTransactionRepository:
     def lock_payer(self, document: str) -> None:
         """Faz Pix simultâneos do MESMO pagador passarem um de cada vez.
 
-        Sem a trava, dois Pix que chegam juntos leem o mesmo score (os
-        pontos de um ainda não foram gravados quando o outro olha), e os
-        dois passam onde o segundo deveria ter sido barrado.
+        Sem a trava, dois Pix que chegam juntos leem o mesmo histórico (o
+        primeiro ainda não foi gravado quando o segundo olha), e o segundo
+        não herda o risco do primeiro nem conta na velocidade.
 
         É uma trava consultiva (advisory) e não um SELECT ... FOR UPDATE
         porque não existe linha para travar: o antifraude não tem tabela
@@ -53,66 +54,47 @@ class PixTransactionRepository:
         transaction_date: datetime,
         history_start: datetime,
         short_window_start: datetime,
-        day_start: datetime,
+        burst_window_start: datetime,
         destination: dict,
         device_id: str,
-        night_start_hour: int,
-        night_end_hour: int,
-        split_min_amount: int,
-        split_max_amount: int,
+        hour_band: List[int],
     ) -> dict:
-        """Tudo o que o motor precisa saber do pagador, numa consulta só.
+        """O "normal" do pagador, numa consulta só.
 
-        Uma consulta com FILTER, e não uma por regra: cada uma passaria
+        Uma consulta com FILTER, e não uma por métrica: cada uma passaria
         pelas mesmas linhas do índice (source_document, transaction_date).
 
-        Três recortes de status aparecem aqui, e a diferença entre eles
-        é a parte que importa:
+        Dois recortes aparecem aqui, e a diferença entre eles é a parte
+        que importa:
 
-        • qualquer status — contar TENTATIVAS. Pix reprovado também é
-          comportamento (fracionamento barrado continua sendo
-          fracionamento).
-        • aceito (approved ou 2FA não falhado) — somar DINHEIRO. Pix
-          reprovado não saiu, e 2FA que falhou também não.
-        • confiável (approved ou 2FA confirmado) — dizer que um destino é
-          CONHECIDO. Só vira conhecido quem já recebeu de verdade.
+        • confiável (approved, ou 2FA confirmado) — dizer o que é NORMAL
+          para o cliente: o horário de costume, o ticket médio, o destino
+          conhecido. O que o ladrão fez (reprovado, 2FA pendente ou
+          falhado) não pode virar o normal de ninguém.
+        • qualquer status — contar TENTATIVAS. A rajada do ladrão conta
+          mesmo quando foi barrada.
         """
-        accepted = and_(
-            AnalysisStatus.enumerator.in_([AnalysisStatus.APPROVED, AnalysisStatus.TWO_FACTOR_REQUIRED]),
-            or_(TwoFactorResult.result.is_(None), TwoFactorResult.result != TwoFactorResult.FAILED),
-        )
-        trusted = or_(
-            AnalysisStatus.enumerator == AnalysisStatus.APPROVED,
-            TwoFactorResult.result == TwoFactorResult.CONFIRMED,
-        )
+        trusted = self._trusted()
         same_destination = and_(
             PixTransaction.dest_participant == destination["participant"],
             PixTransaction.dest_branch == destination["branch"],
             PixTransaction.dest_account == destination["account"],
         )
         local_hour = func.extract("hour", func.timezone(SAO_PAULO_TIMEZONE, PixTransaction.transaction_date))
-        at_night = or_(local_hour >= night_start_hour, local_hour < night_end_hour)
         in_short_window = PixTransaction.transaction_date > short_window_start
 
         row = (
             self.session.query(
-                func.count(PixTransaction.id).label("pix_count"),
-                func.count(PixTransaction.id).filter(accepted).label("accepted_count"),
-                func.avg(PixTransaction.amount).filter(accepted).label("average_ticket"),
-                func.coalesce(
-                    func.sum(PixTransaction.amount).filter(and_(accepted, PixTransaction.transaction_date >= day_start)), 0
-                ).label("sum_today"),
-                func.coalesce(func.sum(PixTransaction.amount).filter(and_(accepted, in_short_window)), 0).label("sum_short_window"),
-                func.count(PixTransaction.id)
-                .filter(and_(in_short_window, at_night, PixTransaction.amount.between(split_min_amount, split_max_amount)))
-                .label("split_count"),
+                func.count(PixTransaction.id).filter(trusted).label("trusted_count"),
+                func.avg(PixTransaction.amount).filter(trusted).label("average_ticket"),
+                func.count(PixTransaction.id).filter(and_(trusted, local_hour.in_(hour_band))).label("same_hour_band_count"),
                 func.coalesce(func.bool_or(and_(same_destination, trusted)), False).label("known_destination"),
+                func.count(PixTransaction.id)
+                .filter(PixTransaction.transaction_date > burst_window_start)
+                .label("burst_count"),
                 func.coalesce(
                     func.bool_or(and_(in_short_window, PixTransaction.device_id != device_id)), False
                 ).label("other_device_in_short_window"),
-                func.count(PixTransaction.id)
-                .filter(and_(in_short_window, TwoFactorResult.result == TwoFactorResult.FAILED))
-                .label("failed_two_factor_count"),
             )
             .select_from(PixTransaction)
             .join(Analysis, Analysis.pix_transaction_id == PixTransaction.id)
@@ -131,60 +113,54 @@ class PixTransactionRepository:
             average_ticket = int(row.average_ticket)
 
         return {
-            "pix_count": row.pix_count,
-            "accepted_count": row.accepted_count,
+            "trusted_count": row.trusted_count,
             "average_ticket": average_ticket,
-            "sum_today": int(row.sum_today),
-            "sum_short_window": int(row.sum_short_window),
-            "split_count": row.split_count,
+            "same_hour_band_count": row.same_hour_band_count,
             "known_destination": row.known_destination,
+            "burst_count": row.burst_count,
             "other_device_in_short_window": row.other_device_in_short_window,
-            "failed_two_factor_count": row.failed_two_factor_count,
         }
 
-    # As duas consultas abaixo estão em SQL escrito, e não no construtor
-    # de consultas do SQLAlchemy: UNION e NOT EXISTS ficam mais legíveis
-    # assim, e quem for conferir a regra lê a consulta como ela roda.
+    def known_places(self, document: str, history_start: datetime, transaction_date: datetime) -> List[Tuple[float, float]]:
+        """Os lugares de costume do pagador: de onde saíram os Pix confiáveis dele na janela.
 
-    def count_new_destinations(self, document: str, window_start: datetime, transaction_date: datetime, destination: dict) -> int:
-        """Quantos destinos DIFERENTES, pagos na janela, o pagador nunca tinha pago antes dela.
+        Só Pix aprovado, ou com 2FA confirmado, ensina um lugar. Um Pix
+        reprovado, ou com 2FA pendente ou falhado, pode ter sido feito
+        pelo ladrão — e o lugar do ladrão não pode virar "de costume".
 
-        O destino deste Pix entra na conta (o UNION), porque a pergunta é
-        "com este, quantos são?".
+        As coordenadas saem arredondadas em duas casas (~1 km), sem
+        repetição: cem Pix feitos de casa viram um lugar só, e a conta de
+        distância do Modo Rua roda sobre poucos pontos.
         """
-        query = text(
-            """
-            SELECT COUNT(*) FROM (
-                SELECT dest_participant, dest_branch, dest_account
-                FROM pix_transaction
-                WHERE source_document = :document
-                  AND transaction_date > :window_start
-                  AND transaction_date <= :transaction_date
-                UNION
-                SELECT CAST(:participant AS CHAR(8)), CAST(:branch AS VARCHAR(10)), CAST(:account AS VARCHAR(20))
-            ) AS destination
-            WHERE NOT EXISTS (
-                SELECT 1 FROM pix_transaction AS earlier
-                WHERE earlier.source_document = :document
-                  AND earlier.dest_participant = destination.dest_participant
-                  AND earlier.dest_branch = destination.dest_branch
-                  AND earlier.dest_account = destination.dest_account
-                  AND earlier.transaction_date <= :window_start
+        rounded_latitude = func.round(PixTransaction.latitude, 2)
+        rounded_longitude = func.round(PixTransaction.longitude, 2)
+
+        rows = (
+            self.session.query(rounded_latitude, rounded_longitude)
+            .select_from(PixTransaction)
+            .join(Analysis, Analysis.pix_transaction_id == PixTransaction.id)
+            .join(AnalysisStatus, AnalysisStatus.id == Analysis.status_id)
+            .outerjoin(TwoFactorResult, TwoFactorResult.analysis_id == Analysis.id)
+            .filter(
+                PixTransaction.source_document == document,
+                PixTransaction.transaction_date > history_start,
+                PixTransaction.transaction_date <= transaction_date,
+                PixTransaction.latitude.isnot(None),
+                self._trusted(),
             )
-            """
+            .distinct()
+            .all()
         )
-        parameters = {
-            "document": document,
-            "window_start": window_start,
-            "transaction_date": transaction_date,
-            "participant": destination["participant"],
-            "branch": destination["branch"],
-            "account": destination["account"],
-        }
-        return self.session.execute(query, parameters).scalar()
+
+        return [(float(latitude), float(longitude)) for latitude, longitude in rows]
 
     def count_destination_payers(self, destination: dict, window_start: datetime, transaction_date: datetime, document: str) -> int:
-        """Quantos pagadores diferentes a conta de destino recebeu na janela, contando este."""
+        """Quantos pagadores diferentes a conta de destino recebeu na janela, contando este.
+
+        Em SQL escrito, e não no construtor de consultas: o UNION fica mais
+        legível assim, e quem for conferir a regra lê a consulta como ela
+        roda.
+        """
         query = text(
             """
             SELECT COUNT(*) FROM (
@@ -236,4 +212,23 @@ class PixTransactionRepository:
                 PixTransaction.transaction_date <= transaction_date,
             )
             .scalar()
+        )
+
+    def count_other_payers_on_ip(self, ip: str, window_start: datetime, transaction_date: datetime, document: str) -> int:
+        """Quantos OUTROS pagadores usaram este mesmo IP na janela."""
+        return (
+            self.session.query(func.count(func.distinct(PixTransaction.source_document)))
+            .filter(
+                PixTransaction.ip == ip,
+                PixTransaction.source_document != document,
+                PixTransaction.transaction_date > window_start,
+                PixTransaction.transaction_date <= transaction_date,
+            )
+            .scalar()
+        )
+
+    def _trusted(self):
+        return or_(
+            AnalysisStatus.enumerator == AnalysisStatus.APPROVED,
+            TwoFactorResult.result == TwoFactorResult.CONFIRMED,
         )

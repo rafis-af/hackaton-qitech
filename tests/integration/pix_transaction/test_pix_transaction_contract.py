@@ -1,3 +1,5 @@
+from datetime import datetime, timedelta, timezone
+
 from tests.utils import DbUtils, ObjectGenerator, PayloadGenerator, RequestGenerator
 
 
@@ -32,6 +34,8 @@ class TestPixTransactionContract:
         campos_tortos = [
             ("amount", 0),
             ("amount", "150000"),
+            # acima do BIGINT: sem o maximum do schema, isto virava 500
+            ("amount", 99999999999999999999),
             ("transaction_date", "17/10/2026 22:15"),
             ("transaction_date", "2026-10-17T22:15:00"),  # sem fuso: "22:15 de onde?"
         ]
@@ -57,14 +61,18 @@ class TestPixTransactionContract:
     def test_small_daytime_pix_is_approved_without_friction(self):
         analysis = ObjectGenerator.send_pix(amount=5000)
 
+        # Pagador novo, de dia, valor pequeno: só o destino novo pesa (5).
         assert analysis["status"] == "approved"
-        assert analysis["metadata"]["risk_score"] == 0
-        assert analysis["metadata"]["signals"] == []
+        assert analysis["metadata"]["risk_score"] == 5
+        assert ObjectGenerator.fired_rules(analysis) == ["new_destination"]
         assert len(analysis["key"]) == 36
 
     def test_challenge_example_asks_two_factor(self):
         """O JSON do desafio, como está. O banco nasce de novo antes, porque o
-        pagador do exemplo é fixo e o histórico de uma rodada anterior mudaria o score.
+        pagador do exemplo é fixo e o histórico de uma rodada anterior mudaria o risco.
+
+        noite sem histórico (20) + valor alto sem histórico (15) + destino
+        novo e conta de 7 dias (15) = 50.
         """
         DbUtils.rollback()
         payload = PayloadGenerator.create_challenge_payload()
@@ -73,18 +81,41 @@ class TestPixTransactionContract:
 
         assert status == 201
         assert response["status"] == "two_factor_required"
-        assert response["metadata"]["risk_score"] == 3
-        assert ObjectGenerator.fired_rules(response) == [
-            "unknown_level_daily_limit",
-            "payer_without_history",
-            "night_limit",
-            "new_destination_account",
-        ]
+        assert response["metadata"]["risk_score"] == 50
+        assert ObjectGenerator.metric_points(response) == {
+            "hour": 20,
+            "amount": 15,
+            "location": 0,
+            "velocity": 0,
+            "destination": 15,
+            "origin": 0,
+        }
+        assert response["metadata"]["receita"] == {"source": "api", "situation": "regular"}
         assert ObjectGenerator.decision(response) == {
             "reason": "risk_score",
-            "rules": ["night_limit", "new_destination_account"],
-            "description": "2FA pedido: score de risco 3 de 5: 0 ponto(s) dos últimos 7 dias + 3 deste Pix",
+            "rules": [
+                "night_without_history",
+                "high_amount_without_history",
+                "new_destination",
+                "new_destination_account",
+            ],
+            "description": (
+                "2FA pedido: risco 50 de 100 (50 deste Pix + 0 herdado das últimas 24h). "
+                "Pesaram: horário 20, valor 15, destino 15"
+            ),
         }
+
+    def test_marks_transaction_date_far_from_arrival(self):
+        """A data do payload longe da hora de chegada fica registrada, sem mudar a decisão."""
+        now = datetime.now(timezone(timedelta(hours=-3)))
+
+        on_time = ObjectGenerator.send_pix(transaction_date=now)
+        old = ObjectGenerator.send_pix(transaction_date=now - timedelta(days=3))
+
+        assert on_time["metadata"]["arrival"]["far_from_arrival"] is False
+        assert old["metadata"]["arrival"]["far_from_arrival"] is True
+        assert old["metadata"]["arrival"]["transaction_date_offset_minutes"] <= -3 * 24 * 60
+        assert old["status"] == on_time["status"] == "approved"
 
     def test_get_returns_the_saved_analysis(self):
         analysis = ObjectGenerator.send_pix()

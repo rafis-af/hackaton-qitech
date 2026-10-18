@@ -1,6 +1,6 @@
-"""O motor sem banco: cada regra recebe os fatos prontos e só compara.
+"""O motor sem banco: cada sinal recebe os fatos prontos e só compara.
 
-É por isso que as regras são funções puras — cada limiar é testado na
+É por isso que os sinais são funções puras — cada limiar é testado na
 borda, com um dicionário na mão, em milissegundos.
 """
 from datetime import datetime, timedelta, timezone
@@ -12,36 +12,50 @@ BRASILIA = timezone(timedelta(hours=-3))
 DAYTIME = datetime(2026, 10, 14, 14, 0, tzinfo=BRASILIA)
 NIGHTTIME = datetime(2026, 10, 14, 22, 15, tzinfo=BRASILIA)
 
+SAO_PAULO = (-23.56, -46.65)
+GUARULHOS = (-23.45, -46.53)   # ~17 km de São Paulo
+CAMPINAS = (-22.91, -47.06)    # ~85 km de São Paulo
+SALVADOR = (-12.97, -38.50)    # ~1.450 km de São Paulo
+
+# O catálogo como está no database.sql: (enumerator, rótulo, teto).
+METRICS = [
+    SimpleNamespace(enumerator="hour", label="horário", max_points=35),
+    SimpleNamespace(enumerator="amount", label="valor", max_points=30),
+    SimpleNamespace(enumerator="location", label="local", max_points=25),
+    SimpleNamespace(enumerator="velocity", label="velocidade", max_points=20),
+    SimpleNamespace(enumerator="destination", label="destino", max_points=15),
+    SimpleNamespace(enumerator="origin", label="origem", max_points=10),
+]
+
 
 def make_facts(**overrides) -> dict:
-    """Um Pix que não dispara regra nenhuma; cada teste muda só o que importa."""
+    """Um Pix de um cliente com histórico que não dispara sinal nenhum; cada teste muda só o que importa."""
     facts = {
         "amount": 5000,
         "transaction_date": DAYTIME,
         "device_id": "dvc-1",
-        "payer": {"document": "12345678909", "document_is_valid": True, "is_person": True, "level": "gold"},
+        "location": SAO_PAULO,
+        "known_places": [SAO_PAULO],
+        "payer": {"document": "12345678909", "document_is_valid": True, "restricted_reason": None},
         "destination": {
             "document": "98765432100",
             "document_is_valid": True,
             "opening_date": DAYTIME - timedelta(days=365),
             "restricted_reason": None,
+            "receita_situation": "regular",
         },
-        "street_mode": None,
         "history": {
-            "pix_count": 10,
-            "accepted_count": 10,
+            "trusted_count": 20,
             "average_ticket": 10000,
-            "sum_today": 0,
-            "sum_short_window": 0,
-            "split_count": 0,
+            "same_hour_band_count": 10,
             "known_destination": True,
+            "burst_count": 0,
             "other_device_in_short_window": False,
-            "failed_two_factor_count": 0,
         },
-        "new_destinations": 0,
         "destination_payers": 1,
         "last_device_id": "dvc-1",
         "other_payers_on_device": 0,
+        "other_payers_on_ip": 0,
     }
 
     for key, value in overrides.items():
@@ -53,218 +67,293 @@ def make_facts(**overrides) -> dict:
     return facts
 
 
-def rule(enumerator: str, action: str = "score", points: int = 1) -> SimpleNamespace:
+def rule(enumerator: str, metric: str = None, points: int = 0) -> SimpleNamespace:
+    action = "score" if metric else "reject"
+    risk_metric = SimpleNamespace(enumerator=metric) if metric else None
+
     return SimpleNamespace(
-        enumerator=enumerator, family="test", action=action, points=points, description=f"descrição de {enumerator}"
+        enumerator=enumerator,
+        risk_metric=risk_metric,
+        action=action,
+        points=points,
+        description=f"descrição de {enumerator}",
     )
+
+
+# O catálogo de sinais como está no database.sql.
+CATALOG = [
+    rule("invalid_document_number"),
+    rule("restricted_payer"),
+    rule("restricted_destination"),
+    rule("receita_destination_blocked"),
+    rule("unusual_hour", "hour", 35),
+    rule("rare_hour", "hour", 20),
+    rule("night_without_history", "hour", 20),
+    rule("amount_5x_profile", "amount", 30),
+    rule("amount_3x_profile", "amount", 20),
+    rule("amount_2x_profile", "amount", 10),
+    rule("high_amount_without_history", "amount", 15),
+    rule("far_from_usual_places", "location", 25),
+    rule("burst_4_in_10_minutes", "velocity", 20),
+    rule("burst_3_in_10_minutes", "velocity", 10),
+    rule("new_destination", "destination", 5),
+    rule("new_destination_account", "destination", 10),
+    rule("destination_many_payers", "destination", 10),
+    rule("receita_destination_irregular", "destination", 10),
+    rule("device_changed", "origin", 5),
+    rule("device_shared", "origin", 10),
+    rule("ip_shared", "origin", 10),
+]
 
 
 def fires(check, **overrides) -> bool:
     return check(make_facts(**overrides)) is not None
 
 
-class TestRulesAtTheEdge:
-    def test_quiet_pix_fires_nothing(self):
-        all_rules = [rule(name) for name in risk_rules.RULE_CHECKS]
-        assert risk_rules.evaluate(all_rules, make_facts()) == []
+def analyze(previous_analyses: list = None, **overrides) -> dict:
+    """O caminho inteiro do motor, como o controller faz, sem banco."""
+    signals = risk_rules.evaluate(CATALOG, make_facts(**overrides))
+    metric_scores = risk_rules.score_metrics(signals, METRICS)
+    inherited = risk_rules.inherit_risk(previous_analyses or [])
 
-    def test_night_limit_is_above_one_thousand_at_night_for_people_only(self):
-        check = risk_rules.check_night_limit
+    return risk_rules.decide(signals, metric_scores, inherited["points"])
 
-        assert fires(check, transaction_date=NIGHTTIME, amount=100001)
-        assert not fires(check, transaction_date=NIGHTTIME, amount=100000)
-        assert not fires(check, transaction_date=DAYTIME, amount=500000)
-        # 5:59 ainda é noite; 6:00 já é dia
-        assert fires(check, transaction_date=DAYTIME.replace(hour=5, minute=59), amount=150000)
-        assert not fires(check, transaction_date=DAYTIME.replace(hour=6, minute=0), amount=150000)
-        # CNPJ: o limite noturno do Banco Central é de pessoa física
-        assert not fires(check, transaction_date=NIGHTTIME, amount=150000, payer={"is_person": False})
 
-    def test_silver_limit_rejects_only_explicit_silver(self):
-        check = risk_rules.check_silver_daily_limit_exceeded
+class TestTheRulesOfTheGame:
+    """As propriedades que a apresentação defende, testadas como propriedades."""
 
-        assert fires(check, payer={"level": "silver"}, amount=60000, history={"sum_today": 50000})
-        assert not fires(check, payer={"level": "silver"}, amount=50000, history={"sum_today": 50000})
-        assert not fires(check, payer={"level": "gold"}, amount=900000)
-        assert not fires(check, payer={"level": None}, amount=900000)
+    def test_no_metric_decides_alone(self):
+        """O maior teto (35) fica abaixo de onde o 2FA começa (40)."""
+        for metric in METRICS:
+            assert metric.max_points < risk_rules.TWO_FACTOR_FROM, metric.enumerator
 
-    def test_unknown_level_assumes_silver(self):
-        check = risk_rules.check_unknown_level_daily_limit
+    def test_hour_weighs_more_than_location(self):
+        ceilings = {metric.enumerator: metric.max_points for metric in METRICS}
+        assert ceilings["hour"] > ceilings["location"]
 
-        observed = check(make_facts(payer={"level": None}, amount=100001))
-        assert observed["assumed_level"] == "silver"
-        assert not fires(check, payer={"level": None}, amount=100000)
-        assert not fires(check, payer={"level": "gold"}, amount=900000)
+    def test_quiet_pix_has_no_risk(self):
+        decision = analyze()
 
-    def test_payer_without_history_pays_small_things_freely(self):
-        check = risk_rules.check_payer_without_history
-        no_history = {"pix_count": 0, "accepted_count": 0, "average_ticket": None}
+        assert decision["risk_score"] == 0
+        assert decision["status"] == "approved"
 
-        assert fires(check, history=no_history, amount=20001)
-        assert not fires(check, history=no_history, amount=20000)
-        assert not fires(check, amount=900000)
+    def test_two_strong_metrics_ask_two_factor_and_three_reject(self):
+        two = analyze(history={"same_hour_band_count": 0}, location=SALVADOR)
+        three = analyze(history={"same_hour_band_count": 0}, location=SALVADOR, amount=60000)
 
-    def test_street_mode_without_limit_asks_every_pix(self):
-        check = risk_rules.check_street_mode
+        assert two["transaction_risk"] == 35 + 25
+        assert two["status"] == "two_factor_required"
+        assert three["transaction_risk"] == 35 + 25 + 30
+        assert three["status"] == "rejected"
 
-        assert fires(check, street_mode={"active": True, "limit": None}, amount=1)
-        assert not fires(check, street_mode={"active": False, "limit": None}, amount=900000)
-        # Sem o campo no payload, o Modo Rua não existe para este Pix
-        assert not fires(check, street_mode=None, amount=900000)
 
-    def test_street_mode_with_limit_asks_only_above_it(self):
-        check = risk_rules.check_street_mode
-        street_mode = {"active": True, "limit": 20000}
+class TestHour:
+    def test_never_paid_at_this_hour(self):
+        assert fires(risk_rules.check_unusual_hour, history={"same_hour_band_count": 0})
+        assert not fires(risk_rules.check_unusual_hour)
 
-        assert not fires(check, street_mode=street_mode, amount=20000)
-        assert fires(check, street_mode=street_mode, amount=20001)
+    def test_rare_hour_is_under_ten_percent(self):
+        # 1 de 20 = 5%: raro. 2 de 20 = 10%: não é mais.
+        assert fires(risk_rules.check_rare_hour, history={"same_hour_band_count": 1})
+        assert not fires(risk_rules.check_rare_hour, history={"same_hour_band_count": 2})
 
-    def test_split_counts_this_pix_too(self):
-        check = risk_rules.check_split_below_night_limit
+    def test_without_history_night_is_the_reference(self):
+        no_history = {"trusted_count": 2, "same_hour_band_count": 0}
 
-        # dois anteriores + este = 3
-        assert fires(check, transaction_date=NIGHTTIME, amount=90000, history={"split_count": 2})
-        assert not fires(check, transaction_date=NIGHTTIME, amount=90000, history={"split_count": 1})
-        # fora da faixa, ou de dia, não é fracionamento
-        assert not fires(check, transaction_date=NIGHTTIME, amount=79999, history={"split_count": 5})
-        assert not fires(check, transaction_date=DAYTIME, amount=90000, history={"split_count": 5})
+        assert fires(risk_rules.check_night_without_history, history=no_history, transaction_date=NIGHTTIME)
+        assert not fires(risk_rules.check_night_without_history, history=no_history, transaction_date=DAYTIME)
+        # com histórico, quem decide é o horário de costume, e não a noite
+        assert not fires(risk_rules.check_unusual_hour, history=no_history)
+        assert not fires(risk_rules.check_night_without_history, transaction_date=NIGHTTIME)
 
-    def test_high_amount_only_matters_for_a_new_destination(self):
-        """A tese: valor alto para destino conhecido é o aluguel, não fraude."""
-        check = risk_rules.check_amount_above_profile
+    def test_night_worker_is_not_punished_for_the_night(self):
+        """Quem sempre paga de madrugada: a noite é o normal dele."""
+        decision = analyze(transaction_date=DAYTIME.replace(hour=3), history={"same_hour_band_count": 15})
+        assert decision["risk_score"] == 0
 
-        assert fires(check, amount=30001, history={"known_destination": False})
-        assert not fires(check, amount=30001, history={"known_destination": True})
-        assert not fires(check, amount=30000, history={"known_destination": False})
-        # Sem padrão (menos de 3 Pix), não há com o que comparar
-        assert not fires(check, amount=900000, history={"known_destination": False, "accepted_count": 2})
+    def test_hour_band_wraps_around_midnight(self):
+        assert risk_rules.hour_band(0) == [0, 1, 23]
+        assert risk_rules.hour_band(14) == [13, 14, 15]
 
-    def test_daily_sum_has_a_floor(self):
-        check = risk_rules.check_daily_sum_above_profile
 
-        # ticket de R$ 100: 5x seria R$ 500, mas o piso é R$ 1.000
-        assert not fires(check, amount=60000, history={"sum_short_window": 30000})
-        assert fires(check, amount=60000, history={"sum_short_window": 40001})
+class TestAmount:
+    def test_ratio_levels_against_the_average_ticket(self):
+        # ticket médio de R$ 100
+        assert fires(risk_rules.check_amount_5x_profile, amount=50000)
+        assert fires(risk_rules.check_amount_3x_profile, amount=30000)
+        assert not fires(risk_rules.check_amount_3x_profile, amount=50000)
+        assert fires(risk_rules.check_amount_2x_profile, amount=20000)
+        assert not fires(risk_rules.check_amount_2x_profile, amount=19999)
 
-    def test_device_changed_now_and_in_the_next_hours(self):
-        check = risk_rules.check_device_changed
+    def test_without_ticket_a_thousand_reais_is_the_reference(self):
+        no_history = {"trusted_count": 2, "average_ticket": 5000}
 
-        # o último Pix foi de outro aparelho: a troca é agora
-        assert fires(check, last_device_id="dvc-antigo")
-        # o último já foi deste aparelho, mas houve outro nas últimas 24h
-        assert fires(check, history={"other_device_in_short_window": True})
-        # mesmo aparelho de sempre
-        assert not fires(check)
-        # primeiro Pix da vida: não há aparelho antigo para comparar
-        assert not fires(check, last_device_id=None)
+        assert fires(risk_rules.check_high_amount_without_history, history=no_history, amount=100001)
+        assert not fires(risk_rules.check_high_amount_without_history, history=no_history, amount=100000)
+        assert not fires(risk_rules.check_amount_5x_profile, history=no_history, amount=900000)
 
-    def test_device_shared_with_another_payer(self):
-        assert fires(risk_rules.check_device_shared, other_payers_on_device=1)
-        assert not fires(risk_rules.check_device_shared, other_payers_on_device=0)
+    def test_rent_alone_does_not_decide(self):
+        """A tese: R$ 5.000 para o destino de sempre é o aluguel. Valor alto sozinho aprova."""
+        decision = analyze(amount=500000)
 
-    def test_new_destination_account_is_under_thirty_days(self):
-        check = risk_rules.check_new_destination_account
+        assert decision["transaction_risk"] == 30
+        assert decision["status"] == "approved"
 
-        assert fires(check, destination={"opening_date": DAYTIME - timedelta(days=29, hours=23)})
-        assert not fires(check, destination={"opening_date": DAYTIME - timedelta(days=30)})
 
-    def test_counterparty_thresholds(self):
-        assert fires(risk_rules.check_many_new_destinations, new_destinations=5)
-        assert not fires(risk_rules.check_many_new_destinations, new_destinations=4)
+class TestLocation:
+    def test_distance_is_in_km(self):
+        assert 15 < risk_rules.distance_km(SAO_PAULO, GUARULHOS) < 20
+        assert 80 < risk_rules.distance_km(SAO_PAULO, CAMPINAS) < 90
+        assert 1400 < risk_rules.distance_km(SAO_PAULO, SALVADOR) < 1500
+
+    def test_far_from_every_known_place(self):
+        assert fires(risk_rules.check_far_from_usual_places, location=SALVADOR)
+        assert not fires(risk_rules.check_far_from_usual_places, location=GUARULHOS)
+
+    def test_measures_to_the_nearest_place_not_to_the_average(self):
+        """Casa em São Paulo, trabalho em Campinas: os dois são de costume."""
+        known_places = [SAO_PAULO, CAMPINAS]
+
+        assert not fires(risk_rules.check_far_from_usual_places, location=SAO_PAULO, known_places=known_places)
+        assert not fires(risk_rules.check_far_from_usual_places, location=CAMPINAS, known_places=known_places)
+
+    def test_needs_something_to_compare(self):
+        assert not fires(risk_rules.check_far_from_usual_places, location=None)
+        assert not fires(risk_rules.check_far_from_usual_places, location=SALVADOR, known_places=[])
+
+    def test_the_traveler_is_not_stopped(self):
+        """Longe de casa, de dia, para um destino conhecido: só o local pesa, e aprova."""
+        decision = analyze(location=SALVADOR)
+
+        assert decision["transaction_risk"] == 25
+        assert decision["status"] == "approved"
+
+
+class TestVelocity:
+    def test_this_pix_counts_too(self):
+        # dois anteriores + este = 3; três anteriores + este = 4
+        assert fires(risk_rules.check_burst_3_in_10_minutes, history={"burst_count": 2})
+        assert not fires(risk_rules.check_burst_4_in_10_minutes, history={"burst_count": 2})
+        assert fires(risk_rules.check_burst_4_in_10_minutes, history={"burst_count": 3})
+        assert not fires(risk_rules.check_burst_3_in_10_minutes, history={"burst_count": 3})
+        assert not fires(risk_rules.check_burst_3_in_10_minutes, history={"burst_count": 1})
+
+
+class TestDestinationAndOrigin:
+    def test_destination_signals(self):
+        assert fires(risk_rules.check_new_destination, history={"known_destination": False})
+        assert fires(risk_rules.check_new_destination_account, destination={"opening_date": DAYTIME - timedelta(days=29)})
+        assert not fires(risk_rules.check_new_destination_account, destination={"opening_date": DAYTIME - timedelta(days=30)})
         assert fires(risk_rules.check_destination_many_payers, destination_payers=5)
         assert not fires(risk_rules.check_destination_many_payers, destination_payers=4)
-        assert fires(risk_rules.check_restricted_destination, destination={"restricted_reason": "confirmed_fraud"})
-        assert fires(risk_rules.check_two_factor_failed_recently, history={"failed_two_factor_count": 1})
+        assert fires(risk_rules.check_receita_destination_irregular, destination={"receita_situation": "suspended"})
 
-    def test_invalid_document_names_the_field(self):
-        observed = risk_rules.check_invalid_document_number(make_facts(destination={"document_is_valid": False}))
-        assert observed == {"invalid_fields": ["destination_account.owner.document_number"]}
-
-
-class TestDecision:
-    def signal(self, action: str, points: int = 0, name: str = "x") -> dict:
-        return {
-            "rule": name, "family": "test", "action": action, "points": points,
-            "description": f"descrição de {name}", "observed": {},
-        }
-
-    def test_score_bands(self):
-        assert risk_rules.decide([], 0)["status"] == "approved"
-        assert risk_rules.decide([], 1)["status"] == "approved"
-        assert risk_rules.decide([], 2)["status"] == "two_factor_required"
-        assert risk_rules.decide([], 4)["status"] == "two_factor_required"
-        assert risk_rules.decide([], 5)["status"] == "rejected"
-
-    def test_score_is_capped_at_five(self):
-        decision = risk_rules.decide([self.signal("score", 2), self.signal("score", 2)], 4)
-
-        assert decision["risk_score"] == 5
-        assert decision["points_from_this_pix"] == 4
-        assert decision["status"] == "rejected"
-
-    def test_blocking_rule_names_who_blocked(self):
-        decision = risk_rules.decide(
-            [self.signal("reject", name="restricted_destination"), self.signal("score", 1, name="night_limit")], 0
+    def test_destination_metric_stops_at_its_ceiling(self):
+        """Destino novo (5) + conta nova (10) + muitos pagadores (10) = 25, mas o teto é 15."""
+        decision = analyze(
+            history={"known_destination": False},
+            destination={"opening_date": DAYTIME - timedelta(days=3)},
+            destination_payers=6,
         )
 
+        assert decision["transaction_risk"] == 15
+
+    def test_origin_signals(self):
+        assert fires(risk_rules.check_device_changed, last_device_id="dvc-antigo")
+        assert fires(risk_rules.check_device_changed, history={"other_device_in_short_window": True})
+        assert not fires(risk_rules.check_device_changed, last_device_id=None)
+        assert fires(risk_rules.check_device_shared, other_payers_on_device=1)
+        assert fires(risk_rules.check_ip_shared, other_payers_on_ip=1)
+
+
+class TestFacts:
+    """Fatos não são métricas: reprovam direto, com risco zero."""
+
+    def test_facts_reject_directly(self):
+        cases = [
+            {"payer": {"document_is_valid": False}},
+            {"payer": {"restricted_reason": "sanctions"}},
+            {"destination": {"restricted_reason": "confirmed_fraud"}},
+            {"destination": {"receita_situation": "deceased"}},
+        ]
+
+        for overrides in cases:
+            decision = analyze(**overrides)
+
+            assert decision["status"] == "rejected", overrides
+            assert decision["reason"] == "blocking_rule", overrides
+
+    def test_receita_down_never_rejects(self):
+        assert not fires(risk_rules.check_receita_destination_blocked, destination={"receita_situation": None})
+        assert not fires(risk_rules.check_receita_destination_irregular, destination={"receita_situation": None})
+
+
+class TestMemory:
+    """O risco tem prazo de validade, e a herança depende do que aconteceu no 2FA."""
+
+    def previous(self, risk: int, two_factor_result: str = None, pix_id: str = "pix-anterior") -> dict:
+        return {"pix_id": pix_id, "transaction_risk": risk, "two_factor_result": two_factor_result}
+
+    def test_carried_fraction_by_two_factor_outcome(self):
+        assert risk_rules.inherit_risk([self.previous(50, "confirmed")])["points"] == 0
+        assert risk_rules.inherit_risk([self.previous(50, "failed")])["points"] == 50
+        assert risk_rules.inherit_risk([self.previous(50, "pending")])["points"] == 25
+        assert risk_rules.inherit_risk([self.previous(50)])["points"] == 25
+
+    def test_the_largest_valid_risk_wins(self):
+        inherited = risk_rules.inherit_risk(
+            [self.previous(30, pix_id="a"), self.previous(60, pix_id="b"), self.previous(90, "confirmed", pix_id="c")]
+        )
+
+        assert inherited == {"points": 30, "from_pix_id": "b", "carried_fraction": 0.5}
+
+    def test_the_insistent_thief_is_rejected(self):
+        """Falhou no 2FA e tentou de novo: o risco anterior passa inteiro."""
+        decision = analyze(
+            [self.previous(50, "failed")],
+            history={"same_hour_band_count": 0},
+        )
+
+        assert decision["transaction_risk"] == 35
+        assert decision["inherited_risk"] == 50
+        assert decision["risk_score"] == 85
         assert decision["status"] == "rejected"
-        assert decision["reason"] == "blocking_rule"
-        assert decision["decisive_rules"] == ["restricted_destination"]
-        assert decision["description"] == "Reprovado por regra de bloqueio: descrição de restricted_destination"
 
-    def test_rejected_by_score_names_the_rules_of_this_pix(self):
-        decision = risk_rules.decide([self.signal("score", 2, name="split_below_night_limit")], 4)
+    def test_score_is_capped_at_one_hundred(self):
+        decision = analyze(
+            [self.previous(100, "failed")],
+            history={"same_hour_band_count": 0},
+        )
 
-        assert decision["reason"] == "risk_score"
-        assert decision["decisive_rules"] == ["split_below_night_limit"]
-        assert decision["description"].startswith("Reprovado: score de risco 5 de 5")
+        assert decision["risk_score"] == 100
 
-    def test_two_factor_rules_only_raise_approved(self):
-        """Falta de dado e Modo Rua viram fricção: nunca somam ponto, nunca reprovam, nunca livram ninguém."""
-        street = [self.signal("two_factor", name="street_mode")]
 
-        assert risk_rules.decide(street, 0)["status"] == "two_factor_required"
-        assert risk_rules.decide(street, 0)["reason"] == "two_factor_rule"
-        assert risk_rules.decide(street, 0)["decisive_rules"] == ["street_mode"]
-        assert risk_rules.decide(street, 0)["risk_score"] == 0
-        assert risk_rules.decide(street, 5)["status"] == "rejected"
-
+class TestChallengeExample:
     def test_challenge_example_asks_two_factor(self):
-        """O Pix do desafio, sem histórico: R$ 1.500 às 22:15 para conta de 7 dias.
+        """O Pix do desafio, sem histórico: R$ 1.500 às 22:15 para uma conta de 7 dias.
 
-        noite (+2) + conta nova (+1) = 3, e duas faltas de dado. 2FA, não rejected.
+        noite sem histórico (20) + valor alto sem histórico (15) + destino
+        novo e conta nova (15) = 50. 2FA.
         """
-        facts = make_facts(
+        decision = analyze(
             amount=150000,
             transaction_date=datetime(2026, 10, 17, 22, 15, tzinfo=BRASILIA),
-            payer={"level": None},
             destination={"opening_date": datetime(2026, 10, 10, 9, 0, tzinfo=BRASILIA)},
             history={
-                "pix_count": 0,
-                "accepted_count": 0,
+                "trusted_count": 0,
                 "average_ticket": None,
+                "same_hour_band_count": 0,
                 "known_destination": False,
             },
+            known_places=[],
             last_device_id=None,
-            new_destinations=1,
         )
-        catalog = [
-            rule("unknown_level_daily_limit", "two_factor", 0),
-            rule("payer_without_history", "two_factor", 0),
-            rule("night_limit", "score", 2),
-            rule("device_changed", "score", 1),
-            rule("new_destination_account", "score", 1),
-            rule("amount_above_profile", "score", 2),
-        ]
 
-        signals = risk_rules.evaluate(catalog, facts)
-        decision = risk_rules.decide(signals, previous_points=0)
-
-        assert [signal["rule"] for signal in signals] == [
-            "unknown_level_daily_limit",
-            "payer_without_history",
-            "night_limit",
+        assert decision["transaction_risk"] == 50
+        assert decision["status"] == "two_factor_required"
+        assert decision["decisive_rules"] == [
+            "night_without_history",
+            "high_amount_without_history",
+            "new_destination",
             "new_destination_account",
         ]
-        assert decision["risk_score"] == 3
-        assert decision["status"] == "two_factor_required"

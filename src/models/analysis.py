@@ -12,6 +12,8 @@ class Analysis(Base):
     analysis_key = Column(CHAR(36), nullable=False)
     pix_transaction_id = Column(Integer, ForeignKey(PixTransaction.id), nullable=False)
     status_id = Column(Integer, ForeignKey(AnalysisStatus.id), nullable=False)
+    transaction_risk = Column(SmallInteger, nullable=False)
+    inherited_risk = Column(SmallInteger, nullable=False)
     risk_score = Column(SmallInteger, nullable=False)
     decision_reason = Column(String(20), nullable=False)
     # O nome da coluna é "metadata", mas `metadata` é palavra reservada
@@ -32,4 +34,3 @@ class Analysis(Base):
 
     BLOCKING_RULE = "blocking_rule"
     RISK_SCORE = "risk_score"
-    TWO_FACTOR_RULE = "two_factor_rule"

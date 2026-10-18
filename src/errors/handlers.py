@@ -61,6 +61,13 @@ def register_error_handlers(application: FastAPI) -> None:
         if exception.status_code == 405:
             return qi_exception_to_response(MethodNotAllowed())
 
+        # O FastAPI levanta um 400 próprio quando não consegue nem ler o
+        # corpo — por exemplo, um JSON aninhado tão fundo que o parser
+        # desiste. É erro de quem pediu, e sem esta linha ele virava 500
+        # aqui embaixo: a API se culpando por um corpo que ela não pediu.
+        if exception.status_code == 400:
+            return qi_exception_to_response(InvalidSchema(str(exception.detail)))
+
         logger.error(f"HTTP {exception.status_code} em {request.url.path}: {exception.detail}")
         return qi_exception_to_response(InternalError())
 

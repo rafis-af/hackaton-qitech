@@ -1,5 +1,6 @@
 import functools
 import json
+import math
 import os
 
 from jsonschema import RefResolver, ValidationError, validate
@@ -107,6 +108,8 @@ class SchemaHandler:
                 schema = SchemaCache.get_schema(schema_file_name)
                 resolver = RefResolver(f"file://{SCHEMA_PATH}/", None)
 
+                refuse_what_json_schema_cannot_see(kwargs["payload"])
+
                 try:
                     validate(kwargs["payload"], schema, resolver=resolver)
                 except ValidationError as error:
@@ -187,6 +190,38 @@ def query_params_to_dict(query_params, schema: dict) -> dict:
             parsed_params[param_name] = query_params[param_name]
 
     return parsed_params
+
+
+def refuse_what_json_schema_cannot_see(value, location: list = None) -> None:
+    """Recusa as duas entradas que passam por qualquer schema e explodem depois.
+
+    • NaN e Infinity. Não existem em JSON, mas o parser do Python aceita
+      os dois. E o NaN escapa do `minimum`/`maximum`: toda comparação com
+      NaN dá falso, então "NaN < -90" e "NaN > 90" são ambos falsos e a
+      latitude NaN passaria.
+    • Caractere de controle (NUL, quebra de linha, tab, ESC...). O
+      PostgreSQL recusa NUL dentro de um texto — a gravação explodiria
+      com 500 —, e quebra de linha num id ou num aparelho é sempre lixo.
+      Um `pattern` não resolve: no Python, o `$` aceita uma quebra de
+      linha no fim do texto.
+
+    Vale para o corpo inteiro, campo a campo, antes do schema. O passeio
+    é com uma pilha, e não recursivo: um JSON fundo que o parser aceitou
+    não pode estourar a pilha de chamadas aqui.
+    """
+    pending = [(value, location or [])]
+
+    while pending:
+        current, path = pending.pop()
+
+        if isinstance(current, dict):
+            pending.extend((item, path + [str(key)]) for key, item in current.items())
+        elif isinstance(current, list):
+            pending.extend((item, path + [str(index)]) for index, item in enumerate(current))
+        elif isinstance(current, float) and not math.isfinite(current):
+            raise InvalidSchema(f"{current} is not a valid JSON number in {'.'.join(path)}")
+        elif isinstance(current, str) and any(ord(character) < 32 or ord(character) == 127 for character in current):
+            raise InvalidSchema(f"control characters are not allowed in {'.'.join(path)}")
 
 
 def describe_schema_error(error: ValidationError) -> str:

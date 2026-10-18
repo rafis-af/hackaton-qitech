@@ -17,14 +17,20 @@ class AnalysisDTO:
         # é imutável.
         metadata = deepcopy(analysis.analysis_metadata)
 
-        # O resultado do 2FA não faz parte da decisão: aconteceu depois,
-        # e mora em outra tabela. Ele aparece aqui, ao lado, para quem
-        # consulta ver as duas coisas de uma vez.
+        # O 2FA não faz parte da decisão: é o que acontece depois dela, e
+        # mora em outra tabela. Ele aparece aqui, ao lado, para quem
+        # consulta ver as duas coisas de uma vez — inclusive enquanto
+        # ainda está pendente.
         two_factor_result = analysis.two_factor_result
         if two_factor_result is not None:
+            resolved_at = None
+            if two_factor_result.resolved_at is not None:
+                resolved_at = to_local_isoformat(two_factor_result.resolved_at)
+
             metadata["two_factor"] = {
                 "result": two_factor_result.result,
-                "answered_at": to_local_isoformat(two_factor_result.created_at),
+                "expires_at": to_local_isoformat(two_factor_result.expires_at),
+                "resolved_at": resolved_at,
             }
 
         return {

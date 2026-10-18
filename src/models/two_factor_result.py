@@ -11,10 +11,14 @@ class TwoFactorResult(Base):
     analysis_id = Column(Integer, ForeignKey(Analysis.id), nullable=False)
     result = Column(String(20), nullable=False)
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    expires_at = Column(DateTime(timezone=True), nullable=False)
+    resolved_at = Column(DateTime(timezone=True), nullable=True)
 
     __table_args__ = (UniqueConstraint("analysis_id"),)
 
     analysis = relationship("Analysis", foreign_keys=[analysis_id], back_populates="two_factor_result")
 
+    PENDING = "pending"
     CONFIRMED = "confirmed"
     FAILED = "failed"
+    EXPIRED = "expired"
