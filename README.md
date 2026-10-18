@@ -1,4 +1,4 @@
-# [Nome do grupo]
+# Grupo 15
 **Integrantes:** Rafael Almeida Ferreira e Guilherme Silva Xavier
 
 Motor antifraude de Pix do Hackathon QI Tech 2026. A API recebe um Pix, compara com o histórico daquele cliente e daquele destino, e devolve uma decisão — `approved`, `two_factor_required` ou `rejected` — com o motivo de cada ponto de risco.
