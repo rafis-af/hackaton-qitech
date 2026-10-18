@@ -231,6 +231,27 @@ Se a Receita estiver lenta, fora do ar ou responder algo quebrado, o Pix segue c
 
 Um Pix pequeno, no horário de costume, de casa, para uma conta antiga e conhecida passa como `approved` — mesmo que seja o ladrão. Pegar esse caso exigiria pedir 2FA para quase todo Pix, e travar o cliente bom também é prejuízo. A troca é consciente.
 
+### O relógio do motor: a data do Pix, e não a hora de chegada
+
+Todas as janelas (horário, velocidade, herança, idade da conta) contam a partir do `transaction_date` que vem no payload, e não da hora em que o Pix chegou aqui (`received_at`).
+
+**Por que assim:**
+- Quem chama o antifraude é o banco, autenticado — não o cliente final. A data é a do Pix, informada por quem o processou.
+- A decisão fica **reprodutível**: o mesmo payload dá a mesma decisão a qualquer hora. O exemplo do desafio (22:15) é noturno sempre, e não só se for testado à noite. Com `received_at`, o mesmo JSON daria 2FA às 23h e aprovação às 14h.
+
+**O risco, assumido:** uma data muito distante da chegada pode fazer um Pix escapar das janelas de velocidade e herança. Por isso a distância é sempre medida e registrada em `metadata.arrival` (`far_from_arrival` passa de 15 minutos), e datas absurdas são recusadas (antes do lançamento do Pix ou depois de 2100).
+
+**Em produção:** velocidade e herança passariam a contar pela chegada (`received_at`), que ninguém de fora controla, e um Pix com a data a mais de alguns minutos da chegada seria recusado na porta. O horário do Pix continuaria vindo do payload.
+
+### Segurança
+
+| Ponto | Aqui | Em produção |
+|---|---|---|
+| Segredos de exemplo | O token `default_token` e a senha `bootcamp` estão no repositório para o projeto subir sem configurar nada. **Fora de `APP_ENV=local`/`test`, a API se recusa a subir com eles** (`src/constants.py`) | Segredos de um cofre (secret manager), nunca no repositório |
+| Autenticação | Um token compartilhado (`INTERNAL-TOKEN`), no padrão do Base Service | Identidade de serviço (mTLS ou JWT entre serviços) e permissões separadas: quem analisa (POST), quem consulta (GET), quem informa o 2FA |
+| Volume de chamadas | Sem limite | Rate limit no gateway, na frente da API — e não dentro dela: com vários processos atendendo, um contador em memória não enxergaria os outros |
+| Dados na resposta | **Minimizados:** o metadata não traz IP, nem identificador de aparelho, nem documento — só o que explica a decisão (contagens, distâncias, faixas) | Igual, e com o histórico apagado depois de 90 dias |
+
 ---
 
 ## Como rodar e testar
@@ -314,6 +335,8 @@ Os testes rodam num container próprio, contra a API de pé — sem Python na m�
 - `tests/integration/pix_transaction/`: os cenários pela API — contrato, fatos, cada métrica, Receita, 2FA, herança e concorrência.
 - `tests/integration/test_input_robustness.py`: entrada torta de todo tipo (corpo que não é JSON, tipos errados, datas impossíveis, NaN, caracteres de controle, ids que não cabem num endereço). Nenhuma pode virar 500.
 
+**Testando à mão:** o motor tem memória. Pix do mesmo pagador em sequência contam na velocidade e herdam o risco dos anteriores — é o comportamento esperado, e o `metadata.risk` mostra de onde veio cada ponto. Para cenários independentes, troque o CPF do pagador (e o `device_id`, para a métrica de origem não somar).
+
 ### O mock da Receita
 
 A resposta sai dos três primeiros dígitos do documento de quem recebe:
@@ -335,6 +358,7 @@ A resposta sai dos três primeiros dígitos do documento de quem recebe:
 
 | Variável | Padrão | Para quê |
 |---|---|---|
+| `APP_ENV` | `local` | Fora de `local`/`test`, a API não sobe com os valores de exemplo |
 | `INTERNAL_TOKEN` | `default_token` | A senha que protege as rotas |
 | `RECEITA_ENABLED` | `true` | `false` desliga a consulta à Receita; o motor roda igual, sem as regras dela |
 | `RECEITA_API_TIMEOUT` | `0.5` | Prazo total da consulta, em segundos |

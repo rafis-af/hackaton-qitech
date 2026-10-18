@@ -46,6 +46,13 @@ BYPASS_ENDPOINTS = [
 
 REQUIRED_VARIABLES = ["DATABASE_URL", "INTERNAL_TOKEN"]
 
+# Os ambientes em que os valores de exemplo (token "default_token", banco
+# com senha "bootcamp") são aceitos: a sua máquina e os testes. Em
+# qualquer outro, a API se recusa a subir com eles.
+DEVELOPMENT_ENVIRONMENTS = ["local", "test"]
+EXAMPLE_TOKEN = "default_token"
+EXAMPLE_DATABASE_PASSWORD = ":bootcamp@"
+
 
 def check_variables():
     missing = []
@@ -59,3 +66,40 @@ def check_variables():
             "Rodando com 'docker compose up' elas já vêm preenchidas. "
             "Fora do Docker, copie o .env.example para .env."
         )
+
+    insecure = find_example_secrets(
+        APP_ENV,
+        {
+            "INTERNAL_TOKEN": INTERNAL_TOKEN,
+            "RECEITA_API_INTERNAL_TOKEN": RECEITA_API_INTERNAL_TOKEN,
+            "DATABASE_URL": DATABASE_URL,
+        },
+    )
+
+    if insecure:
+        raise EnvironmentError(
+            f"APP_ENV={APP_ENV} com valores de exemplo em: {', '.join(insecure)}. "
+            "Eles servem para estudar na sua máquina e são públicos (estão no "
+            "repositório). Fora de local/test, defina valores próprios."
+        )
+
+
+def find_example_secrets(app_env: str, settings: dict) -> list:
+    """Quais configurações ainda estão com o valor de exemplo, num ambiente que não é de desenvolvimento.
+
+    O token e a senha do banco do docker-compose.yml estão escritos no
+    repositório: qualquer pessoa que o leia os conhece. Na sua máquina,
+    tudo bem — é o que deixa o projeto subir sem configurar nada. Em
+    produção, seria uma porta aberta. É melhor a API falhar na hora de
+    ligar, com uma mensagem clara, do que subir e atender qualquer um.
+    """
+    if app_env.lower() in DEVELOPMENT_ENVIRONMENTS:
+        return []
+
+    insecure = []
+
+    for name, value in settings.items():
+        if value == EXAMPLE_TOKEN or (value and EXAMPLE_DATABASE_PASSWORD in value):
+            insecure.append(name)
+
+    return insecure

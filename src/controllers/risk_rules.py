@@ -379,7 +379,11 @@ def check_device_changed(facts: dict) -> Optional[dict]:
     if not changed_now and not changed_recently:
         return None
 
-    return {"previous_device_id": last_device_id, "window_hours": DEVICE_CHANGE_WINDOW_HOURS}
+    # Só o FATO da troca, e não o identificador do aparelho anterior: a
+    # análise é consultável pelo GET, e o id de outro aparelho do cliente
+    # não ajuda ninguém a entender a decisão (minimização, LGPD). O mesmo
+    # vale para device_shared e ip_shared, que mostram só a contagem.
+    return {"changed_in_this_pix": changed_now, "window_hours": DEVICE_CHANGE_WINDOW_HOURS}
 
 
 def check_device_shared(facts: dict) -> Optional[dict]:
