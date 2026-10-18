@@ -1,0 +1,12 @@
+{
+  "title": "PostTwoFactor",
+  "type": "object",
+  "properties": {
+    "result": {
+      "type": "string",
+      "enum": ["confirmed", "failed"]
+    }
+  },
+  "required": ["result"],
+  "additionalProperties": false
+}
