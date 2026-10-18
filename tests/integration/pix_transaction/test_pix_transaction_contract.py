@@ -74,7 +74,6 @@ class TestPixTransactionContract:
         assert ObjectGenerator.metric_points(response) == {
             "hour": 20,
             "amount": 15,
-            "location": 0,
             "velocity": 0,
             "destination": 15,
             "origin": 0,

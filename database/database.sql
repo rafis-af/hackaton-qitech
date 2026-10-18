@@ -25,7 +25,6 @@ CREATE TABLE risk_metric(
 INSERT INTO risk_metric (enumerator, label, description, max_points) VALUES
 ('hour',        'horário',     'O Pix saiu num horário em que o cliente não costuma pagar', 35),
 ('amount',      'valor',       'O valor deste Pix, ou a soma do dia, passou do normal do cliente ou do teto', 30),
-('location',    'local',       'O Pix saiu longe de todos os lugares de costume do cliente (Modo Rua)', 25),
 ('velocity',    'velocidade',  'Muitos Pix do cliente em poucos minutos', 20),
 ('destination', 'destino',     'Quem recebe é novo para o cliente, ou dá sinais de conta laranja', 15),
 ('origin',      'origem',      'O aparelho ou o IP não batem com a premissa de um aparelho por conta', 10);
@@ -40,11 +39,11 @@ CREATE TABLE rule(
     description                     VARCHAR(255) NOT NULL,
     created_at                      TIMESTAMPTZ NOT NULL DEFAULT(NOW()),
     UNIQUE(enumerator),
-    CHECK(action IN ('score', 'reject')),
+    CHECK(action IN ('score', 'reject', 'two_factor')),
 
     CHECK(
         (action = 'score' AND risk_metric_id IS NOT NULL AND points > 0)
-        OR (action = 'reject' AND risk_metric_id IS NULL AND points = 0)
+        OR (action IN ('reject', 'two_factor') AND risk_metric_id IS NULL AND points = 0)
     )
 );
 
@@ -56,19 +55,19 @@ INSERT INTO rule (enumerator, risk_metric_id, action, points, description) VALUE
 ('restricted_destination',        NULL, 'reject', 0, 'Quem recebe está na lista restritiva'),
 ('receita_destination_blocked',   NULL, 'reject', 0, 'Na Receita, o CPF/CNPJ de quem recebe não existe, foi cancelado, é nulo ou é de titular falecido'),
 
+('street_mode',                   NULL, 'two_factor', 0, 'Modo Rua: Pix a mais de 30 km de todos os lugares de costume do cliente'),
+
 ('unusual_hour',                  (SELECT id FROM risk_metric WHERE enumerator = 'hour'), 'score', 35, 'O cliente nunca fez Pix nesta faixa de horário nos últimos 90 dias'),
 ('rare_hour',                     (SELECT id FROM risk_metric WHERE enumerator = 'hour'), 'score', 20, 'Menos de 10% dos Pix do cliente saíram nesta faixa de horário'),
 ('night_without_history',         (SELECT id FROM risk_metric WHERE enumerator = 'hour'), 'score', 20, 'Pix entre 20h e 6h de um cliente ainda sem histórico de horários'),
 
-('amount_5x_profile',             (SELECT id FROM risk_metric WHERE enumerator = 'amount'), 'score', 30, 'Valor 5x ou mais acima do ticket médio do cliente'),
-('amount_3x_profile',             (SELECT id FROM risk_metric WHERE enumerator = 'amount'), 'score', 20, 'Valor entre 3x e 5x o ticket médio do cliente'),
-('amount_2x_profile',             (SELECT id FROM risk_metric WHERE enumerator = 'amount'), 'score', 10, 'Valor entre 2x e 3x o ticket médio do cliente'),
-('high_amount_without_history',   (SELECT id FROM risk_metric WHERE enumerator = 'amount'), 'score', 15, 'Pix acima de R$ 1.000 de um cliente ainda sem ticket médio'),
+('amount_5x_profile',             (SELECT id FROM risk_metric WHERE enumerator = 'amount'), 'score', 30, 'Valor 5x ou mais acima do ticket mediano do cliente'),
+('amount_3x_profile',             (SELECT id FROM risk_metric WHERE enumerator = 'amount'), 'score', 20, 'Valor entre 3x e 5x o ticket mediano do cliente'),
+('amount_2x_profile',             (SELECT id FROM risk_metric WHERE enumerator = 'amount'), 'score', 10, 'Valor entre 2x e 3x o ticket mediano do cliente'),
+('high_amount_without_history',   (SELECT id FROM risk_metric WHERE enumerator = 'amount'), 'score', 15, 'Pix acima de R$ 1.000 de um cliente ainda sem ticket mediano'),
 ('night_limit_exceeded',          (SELECT id FROM risk_metric WHERE enumerator = 'amount'), 'score', 20, 'Limite: Pix noturno de pessoa física acima de R$ 1.000, e o cliente nunca passou desse teto à noite'),
 ('day_sum_3x_profile',            (SELECT id FROM risk_metric WHERE enumerator = 'amount'), 'score', 20, 'Montante: a soma das últimas 24 horas passou de 3x o total diário médio do cliente'),
 ('day_sum_without_history',       (SELECT id FROM risk_metric WHERE enumerator = 'amount'), 'score', 15, 'Montante: a soma das últimas 24 horas passou de R$ 1.000, e o cliente ainda não tem total diário médio'),
-
-('far_from_usual_places',         (SELECT id FROM risk_metric WHERE enumerator = 'location'), 'score', 25, 'Modo Rua: Pix a mais de 30 km de todos os lugares de costume do cliente'),
 
 ('burst_4_in_10_minutes',         (SELECT id FROM risk_metric WHERE enumerator = 'velocity'), 'score', 20, '4 ou mais Pix do cliente em 10 minutos'),
 ('burst_3_in_10_minutes',         (SELECT id FROM risk_metric WHERE enumerator = 'velocity'), 'score', 10, '3 Pix do cliente em 10 minutos'),
@@ -152,7 +151,7 @@ CREATE TABLE analysis(
     CHECK(inherited_risk BETWEEN 0 AND 100),
     CHECK(risk_score BETWEEN 0 AND 100),
     CHECK(risk_score = LEAST(100, transaction_risk + inherited_risk)),
-    CHECK(decision_reason IN ('blocking_rule', 'risk_score'))
+    CHECK(decision_reason IN ('blocking_rule', 'risk_score', 'two_factor_rule'))
 );
 
 CREATE TABLE rule_result(

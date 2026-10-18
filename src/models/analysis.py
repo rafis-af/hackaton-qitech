@@ -31,3 +31,4 @@ class Analysis(Base):
 
     BLOCKING_RULE = "blocking_rule"
     RISK_SCORE = "risk_score"
+    TWO_FACTOR_RULE = "two_factor_rule"

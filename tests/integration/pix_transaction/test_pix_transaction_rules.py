@@ -121,7 +121,7 @@ class TestHour:
 
 
 class TestStreetMode:
-    def test_far_alone_does_not_stop_the_traveler(self):
+    def test_far_from_usual_places_asks_two_factor_even_with_low_risk(self):
         payer = RandomGenerator.generate_cpf()
 
         ObjectGenerator.send_pix(payer_document=payer)
@@ -129,19 +129,51 @@ class TestStreetMode:
             payer_document=payer, geolocation=SALVADOR, transaction_date=DAYTIME + timedelta(hours=3)
         )
 
-        assert "far_from_usual_places" in ObjectGenerator.fired_rules(in_salvador)
-        assert ObjectGenerator.metric_points(in_salvador)["location"] == 25
-        assert in_salvador["status"] == "approved"
+        assert in_salvador["status"] == "two_factor_required"
+        assert ObjectGenerator.risk(in_salvador)["transaction_risk"] < 40
+        assert ObjectGenerator.decision(in_salvador)["reason"] == "two_factor_rule"
+        assert ObjectGenerator.decision(in_salvador)["rules"] == ["street_mode"]
+        assert ObjectGenerator.decision(in_salvador)["description"].startswith(
+            "2FA pedido por regra de autenticação (Modo Rua: Pix a mais de 30 km de todos os lugares de costume do cliente)"
+        )
 
-    def test_far_and_at_night_asks_two_factor(self):
+    def test_street_mode_adds_no_points(self):
         payer = RandomGenerator.generate_cpf()
 
         ObjectGenerator.send_pix(payer_document=payer)
-        far_at_night = ObjectGenerator.send_pix(payer_document=payer, geolocation=SALVADOR, transaction_date=NIGHTTIME)
+        in_salvador = ObjectGenerator.send_pix(
+            payer_document=payer, geolocation=SALVADOR, transaction_date=DAYTIME + timedelta(hours=3)
+        )
+        signal = next(signal for signal in in_salvador["metadata"]["signals"] if signal["rule"] == "street_mode")
 
-        assert ObjectGenerator.metric_points(far_at_night)["hour"] == 20
-        assert ObjectGenerator.metric_points(far_at_night)["location"] == 25
-        assert far_at_night["status"] == "two_factor_required"
+        assert signal["points"] == 0
+        assert signal["observed"]["radius_km"] == 30
+        assert signal["observed"]["nearest_known_place_km"] > 1000
+        assert "location" not in ObjectGenerator.metric_points(in_salvador)
+
+    def test_far_with_a_high_score_keeps_the_score_reason(self):
+        payer = RandomGenerator.generate_cpf()
+
+        ObjectGenerator.send_pix(payer_document=payer)
+        far_and_risky = ObjectGenerator.send_two_factor_pix(payer_document=payer, geolocation=SALVADOR)
+
+        assert ObjectGenerator.risk(far_and_risky)["transaction_risk"] >= 40
+        assert ObjectGenerator.decision(far_and_risky)["reason"] == "risk_score"
+        assert "street_mode" in ObjectGenerator.decision(far_and_risky)["rules"]
+        assert "Também pede 2FA: Modo Rua" in ObjectGenerator.decision(far_and_risky)["description"]
+
+    def test_street_mode_never_softens_a_rejection(self):
+        payer = RandomGenerator.generate_cpf()
+
+        ObjectGenerator.send_pix(payer_document=payer)
+        restricted = PayloadGenerator.create_destination(document_number=RESTRICTED_DOCUMENT)
+        far_to_restricted = ObjectGenerator.send_pix(
+            payer_document=payer, geolocation=SALVADOR, destination=restricted, transaction_date=DAYTIME + timedelta(hours=3)
+        )
+
+        assert far_to_restricted["status"] == "rejected"
+        assert ObjectGenerator.decision(far_to_restricted)["reason"] == "blocking_rule"
+        assert "street_mode" in ObjectGenerator.fired_rules(far_to_restricted)
 
     def test_inside_the_radius_changes_nothing(self):
         payer = RandomGenerator.generate_cpf()
@@ -151,7 +183,8 @@ class TestStreetMode:
             payer_document=payer, geolocation=GUARULHOS, transaction_date=DAYTIME + timedelta(hours=1)
         )
 
-        assert "far_from_usual_places" not in ObjectGenerator.fired_rules(in_guarulhos)
+        assert "street_mode" not in ObjectGenerator.fired_rules(in_guarulhos)
+        assert in_guarulhos["status"] == "approved"
 
     def test_without_geolocation_there_is_nothing_to_compare(self):
         payer = RandomGenerator.generate_cpf()
@@ -161,32 +194,58 @@ class TestStreetMode:
             payer_document=payer, geolocation=None, transaction_date=DAYTIME + timedelta(hours=1)
         )
 
-        assert "far_from_usual_places" not in ObjectGenerator.fired_rules(no_location)
+        assert "street_mode" not in ObjectGenerator.fired_rules(no_location)
+
+    def test_without_usual_places_there_is_nothing_to_compare(self):
+        first_pix_ever = ObjectGenerator.send_pix(geolocation=SALVADOR)
+
+        assert "street_mode" not in ObjectGenerator.fired_rules(first_pix_ever)
+        assert first_pix_ever["status"] == "approved"
 
     def test_the_traveler_confirms_once_and_the_city_becomes_usual(self):
         payer = RandomGenerator.generate_cpf()
 
         ObjectGenerator.send_pix(payer_document=payer)
-        first_in_salvador = ObjectGenerator.send_pix(payer_document=payer, geolocation=SALVADOR, transaction_date=NIGHTTIME)
+        first_in_salvador = ObjectGenerator.send_pix(
+            payer_document=payer, geolocation=SALVADOR, transaction_date=DAYTIME + timedelta(hours=3)
+        )
         RequestGenerator.POST_two_factor(first_in_salvador["pix_id"], {"result": "confirmed"})
 
         next_day = ObjectGenerator.send_pix(
-            payer_document=payer, geolocation=SALVADOR, transaction_date=NIGHTTIME + timedelta(hours=14)
+            payer_document=payer, geolocation=SALVADOR, transaction_date=DAYTIME + timedelta(days=1)
         )
 
         assert first_in_salvador["status"] == "two_factor_required"
-        assert "far_from_usual_places" not in ObjectGenerator.fired_rules(next_day)
+        assert "street_mode" not in ObjectGenerator.fired_rules(next_day)
+        assert next_day["status"] == "approved"
 
     def test_unconfirmed_pix_never_teaches_a_place(self):
         payer = RandomGenerator.generate_cpf()
 
         ObjectGenerator.send_pix(payer_document=payer)
-        ObjectGenerator.send_pix(payer_document=payer, geolocation=SALVADOR, transaction_date=NIGHTTIME)
+        ObjectGenerator.send_pix(payer_document=payer, geolocation=SALVADOR, transaction_date=DAYTIME + timedelta(hours=3))
         again_in_salvador = ObjectGenerator.send_pix(
-            payer_document=payer, geolocation=SALVADOR, transaction_date=NIGHTTIME + timedelta(hours=1)
+            payer_document=payer, geolocation=SALVADOR, transaction_date=DAYTIME + timedelta(hours=4)
         )
 
-        assert "far_from_usual_places" in ObjectGenerator.fired_rules(again_in_salvador)
+        assert "street_mode" in ObjectGenerator.fired_rules(again_in_salvador)
+        assert again_in_salvador["status"] == "two_factor_required"
+
+    def test_failed_selfie_never_teaches_a_place(self):
+        payer = RandomGenerator.generate_cpf()
+
+        ObjectGenerator.send_pix(payer_document=payer)
+        thief_in_salvador = ObjectGenerator.send_pix(
+            payer_document=payer, geolocation=SALVADOR, transaction_date=DAYTIME + timedelta(hours=3)
+        )
+        RequestGenerator.POST_two_factor(thief_in_salvador["pix_id"], {"result": "failed"})
+
+        next_day = ObjectGenerator.send_pix(
+            payer_document=payer, geolocation=SALVADOR, transaction_date=DAYTIME + timedelta(days=1)
+        )
+
+        assert "street_mode" in ObjectGenerator.fired_rules(next_day)
+        assert next_day["status"] == "two_factor_required"
 
 
 class TestAmountAndDestination:

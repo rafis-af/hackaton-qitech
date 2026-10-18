@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import List, Optional, Tuple
 
-from sqlalchemy import and_, func, or_, text
+from sqlalchemy import and_, case, func, or_, text
 from sqlalchemy.exc import IntegrityError
 
 from database import Context
@@ -73,7 +73,9 @@ class PixTransactionRepository:
         row = (
             self.session.query(
                 func.count(PixTransaction.id).filter(trusted).label("trusted_count"),
-                func.avg(PixTransaction.amount).filter(trusted).label("average_ticket"),
+                func.percentile_cont(0.5)
+                .within_group(case((trusted, PixTransaction.amount), else_=None))
+                .label("median_ticket"),
                 func.count(PixTransaction.id).filter(and_(trusted, local_hour.in_(hour_band))).label("same_hour_band_count"),
                 func.coalesce(func.bool_or(and_(same_destination, trusted)), False).label("known_destination"),
                 func.count(PixTransaction.id)
@@ -98,13 +100,13 @@ class PixTransactionRepository:
             .one()
         )
 
-        average_ticket = None
-        if row.average_ticket is not None:
-            average_ticket = int(row.average_ticket)
+        median_ticket = None
+        if row.median_ticket is not None:
+            median_ticket = int(row.median_ticket)
 
         return {
             "trusted_count": row.trusted_count,
-            "average_ticket": average_ticket,
+            "median_ticket": median_ticket,
             "same_hour_band_count": row.same_hour_band_count,
             "known_destination": row.known_destination,
             "burst_count": row.burst_count,
