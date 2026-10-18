@@ -10,15 +10,6 @@ SAO_PAULO_TIMEZONE = "America/Sao_Paulo"
 
 
 class PixTransactionRepository:
-    """O histórico de tudo que chegou. Só aqui existe consulta sobre Pix.
-
-    Nenhuma regra mora aqui: estas consultas devolvem NÚMEROS ("quantos Pix
-    o cliente fez nesta faixa de horário"), e quem decide se o número é
-    suspeito é o src/controllers/risk_rules.py. As janelas e as faixas
-    chegam por parâmetro justamente para que nenhum limiar fique escondido
-    numa consulta.
-    """
-
     def __init__(self, context: Context) -> None:
         self.session = context.db_session
 
@@ -35,17 +26,6 @@ class PixTransactionRepository:
         return self.session.query(PixTransaction).filter(PixTransaction.pix_id == pix_id).first()
 
     def lock_payer(self, document: str) -> None:
-        """Faz Pix simultâneos do MESMO pagador passarem um de cada vez.
-
-        Sem a trava, dois Pix que chegam juntos leem o mesmo histórico (o
-        primeiro ainda não foi gravado quando o segundo olha), e o segundo
-        não herda o risco do primeiro nem conta na velocidade.
-
-        É uma trava consultiva (advisory) e não um SELECT ... FOR UPDATE
-        porque não existe linha para travar: o antifraude não tem tabela
-        de clientes. Ela vale até o fim da transação — o commit ou o
-        rollback soltam sozinhos, e não há como esquecer de liberar.
-        """
         self.session.execute(text("SELECT pg_advisory_xact_lock(hashtext(:document))"), {"document": document})
 
     def payer_history(
@@ -59,21 +39,6 @@ class PixTransactionRepository:
         device_id: str,
         hour_band: List[int],
     ) -> dict:
-        """O "normal" do pagador, numa consulta só.
-
-        Uma consulta com FILTER, e não uma por métrica: cada uma passaria
-        pelas mesmas linhas do índice (source_document, transaction_date).
-
-        Dois recortes aparecem aqui, e a diferença entre eles é a parte
-        que importa:
-
-        • confiável (approved, ou 2FA confirmado) — dizer o que é NORMAL
-          para o cliente: o horário de costume, o ticket médio, o destino
-          conhecido. O que o ladrão fez (reprovado, 2FA pendente ou
-          falhado) não pode virar o normal de ninguém.
-        • qualquer status — contar TENTATIVAS. A rajada do ladrão conta
-          mesmo quando foi barrada.
-        """
         trusted = self._trusted()
         same_destination = and_(
             PixTransaction.dest_participant == destination["participant"],
@@ -122,16 +87,6 @@ class PixTransactionRepository:
         }
 
     def known_places(self, document: str, history_start: datetime, transaction_date: datetime) -> List[Tuple[float, float]]:
-        """Os lugares de costume do pagador: de onde saíram os Pix confiáveis dele na janela.
-
-        Só Pix aprovado, ou com 2FA confirmado, ensina um lugar. Um Pix
-        reprovado, ou com 2FA pendente ou falhado, pode ter sido feito
-        pelo ladrão — e o lugar do ladrão não pode virar "de costume".
-
-        As coordenadas saem arredondadas em duas casas (~1 km), sem
-        repetição: cem Pix feitos de casa viram um lugar só, e a conta de
-        distância do Modo Rua roda sobre poucos pontos.
-        """
         rounded_latitude = func.round(PixTransaction.latitude, 2)
         rounded_longitude = func.round(PixTransaction.longitude, 2)
 
@@ -155,12 +110,6 @@ class PixTransactionRepository:
         return [(float(latitude), float(longitude)) for latitude, longitude in rows]
 
     def count_destination_payers(self, destination: dict, window_start: datetime, transaction_date: datetime, document: str) -> int:
-        """Quantos pagadores diferentes a conta de destino recebeu na janela, contando este.
-
-        Em SQL escrito, e não no construtor de consultas: o UNION fica mais
-        legível assim, e quem for conferir a regra lê a consulta como ela
-        roda.
-        """
         query = text(
             """
             SELECT COUNT(*) FROM (
@@ -187,7 +136,6 @@ class PixTransactionRepository:
         return self.session.execute(query, parameters).scalar()
 
     def last_device_id(self, document: str, transaction_date: datetime) -> Optional[str]:
-        """O aparelho do Pix mais recente do pagador antes deste. None se ele nunca fez Pix."""
         return (
             self.session.query(PixTransaction.device_id)
             .filter(
@@ -202,7 +150,6 @@ class PixTransactionRepository:
     def count_other_payers_on_device(
         self, device_id: str, window_start: datetime, transaction_date: datetime, document: str
     ) -> int:
-        """Quantos OUTROS pagadores usaram este mesmo aparelho na janela."""
         return (
             self.session.query(func.count(func.distinct(PixTransaction.source_document)))
             .filter(
@@ -215,7 +162,6 @@ class PixTransactionRepository:
         )
 
     def count_other_payers_on_ip(self, ip: str, window_start: datetime, transaction_date: datetime, document: str) -> int:
-        """Quantos OUTROS pagadores usaram este mesmo IP na janela."""
         return (
             self.session.query(func.count(func.distinct(PixTransaction.source_document)))
             .filter(

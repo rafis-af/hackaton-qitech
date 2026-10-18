@@ -22,7 +22,6 @@ class ClientRequisition:
         query_params=None,
         verify=True,
     ):
-
         if headers is None:
             headers = dict()
 
@@ -80,4 +79,3 @@ class BaseConnectorResponse:
         except Exception as ex:
             print(ex)
             ...
-            # logger warning

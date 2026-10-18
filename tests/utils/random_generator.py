@@ -4,14 +4,6 @@ import random
 class RandomGenerator:
     @staticmethod
     def generate_cpf(prefix: str = ""):
-        """Um CPF válido na conta dos dígitos, aleatório depois do prefixo.
-
-        Sem prefixo, o primeiro dígito nunca é 0. Os casos especiais do mock
-        da Receita (falecido, cancelado, lento...) começam todos com 00, e
-        um CPF aleatório que caísse num deles faria um teste qualquer falhar
-        uma vez a cada tantas rodadas, sem motivo aparente. Quem quer um
-        caso especial pede pelo prefixo.
-        """
         if prefix:
             cpf = [int(digit) for digit in prefix]
         else:

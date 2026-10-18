@@ -4,8 +4,6 @@ from tests.utils import DbUtils, ObjectGenerator, PayloadGenerator, RequestGener
 
 
 class TestPixTransactionContract:
-    """O contrato do desafio: POST analisa e grava, GET devolve o que foi gravado."""
-
     def test_refuses_without_internal_token(self):
         payload = PayloadGenerator.create_pix_payload()
 
@@ -30,14 +28,12 @@ class TestPixTransactionContract:
         assert response["code"] == "QIT000001"
 
     def test_schema_refuses_malformed_fields(self):
-        """Cada volta do laço entorta um campo e mantém os outros certos."""
         campos_tortos = [
             ("amount", 0),
             ("amount", "150000"),
-            # acima do BIGINT: sem o maximum do schema, isto virava 500
             ("amount", 99999999999999999999),
             ("transaction_date", "17/10/2026 22:15"),
-            ("transaction_date", "2026-10-17T22:15:00"),  # sem fuso: "22:15 de onde?"
+            ("transaction_date", "2026-10-17T22:15:00"),
         ]
 
         for campo, valor_torto in campos_tortos:
@@ -61,19 +57,12 @@ class TestPixTransactionContract:
     def test_small_daytime_pix_is_approved_without_friction(self):
         analysis = ObjectGenerator.send_pix(amount=5000)
 
-        # Pagador novo, de dia, valor pequeno: só o destino novo pesa (5).
         assert analysis["status"] == "approved"
         assert analysis["metadata"]["risk_score"] == 5
         assert ObjectGenerator.fired_rules(analysis) == ["new_destination"]
         assert len(analysis["key"]) == 36
 
     def test_challenge_example_asks_two_factor(self):
-        """O JSON do desafio, como está. O banco nasce de novo antes, porque o
-        pagador do exemplo é fixo e o histórico de uma rodada anterior mudaria o risco.
-
-        noite sem histórico (20) + valor alto sem histórico (15) + destino
-        novo e conta de 7 dias (15) = 50.
-        """
         DbUtils.rollback()
         payload = PayloadGenerator.create_challenge_payload()
 
@@ -106,7 +95,6 @@ class TestPixTransactionContract:
         }
 
     def test_marks_transaction_date_far_from_arrival(self):
-        """A data do payload longe da hora de chegada fica registrada, sem mudar a decisão."""
         now = datetime.now(timezone(timedelta(hours=-3)))
 
         on_time = ObjectGenerator.send_pix(transaction_date=now)
@@ -134,7 +122,6 @@ class TestPixTransactionContract:
         assert response["code"] == "QIT002002"
 
     def test_resend_returns_the_original_analysis(self):
-        """O banco não recebeu a resposta e mandou de novo: mesma análise, 200, sem rodar regra."""
         payload = PayloadGenerator.create_pix_payload(amount=50000)
 
         status, original = RequestGenerator.POST_pix_transaction(payload)

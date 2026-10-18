@@ -8,8 +8,6 @@ EXAMPLE_SETTINGS = {
 
 
 class TestExampleSecrets:
-    """Os valores de exemplo do repositório só valem na máquina de quem estuda e nos testes."""
-
     def test_development_environments_accept_example_values(self):
         assert find_example_secrets("local", EXAMPLE_SETTINGS) == []
         assert find_example_secrets("test", EXAMPLE_SETTINGS) == []

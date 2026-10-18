@@ -1,26 +1,3 @@
-"""Mock da Receita Federal: a situação cadastral de um CPF/CNPJ.
-
-Não existe Receita na sua máquina, e tudo bem: este serviço faz o papel
-dela. A resposta sai do PREFIXO do documento (os três primeiros
-dígitos), e por isso é previsível — o mesmo documento dá sempre a mesma
-resposta, e os testes sabem qual é.
-
-    000  não existe (404)
-    001  TITULAR FALECIDO
-    002  CANCELADA
-    003  NULA
-    004  SUSPENSA
-    005  PENDENTE DE REGULARIZACAO
-    006  lento: demora 3 s para responder (simula a Receita engasgada)
-    007  erro 500 (simula a Receita fora do ar)
-    008  resposta sem o campo situation (simula uma resposta quebrada)
-    qualquer outro  REGULAR
-
-Todos os casos especiais começam com 00. Um CPF de verdade raramente
-começa assim, e os geradores de CPF dos testes nunca começam com 0 — a
-menos que o teste peça.
-"""
-
 import time
 
 from fastapi import FastAPI

@@ -1,5 +1,3 @@
-# O mock da Receita Federal. Usa as mesmas versoes do requirements.txt da
-# API, para nao trazer uma dependencia nova so por causa do mock.
 FROM python:3.11-slim
 
 RUN adduser --system --no-create-home user

@@ -1,14 +1,3 @@
-"""Testes de ENTRADA: o que a API faz com qualquer coisa que chegar.
-
-Estes testes não olham regra de antifraude nenhuma. A pergunta é uma só:
-para qualquer entrada torta — corpo que não é JSON, campo do tipo errado,
-data impossível, caractere de controle, id com barra, número que não é
-número — a API responde com um erro de quem pediu (4xx, com código), e
-nunca com um 500?
-
-Um 500 aqui é sempre um bug: quer dizer que a entrada passou pela porta
-e explodiu lá dentro, longe de quem saberia recusá-la.
-"""
 import copy
 import json
 from uuid import uuid4
@@ -36,7 +25,6 @@ def post_raw(body: str, headers: dict = None):
 
 
 def with_field(payload: dict, path: str, value) -> dict:
-    """O payload com o campo em `path` ("a.b.c") trocado por `value`."""
     changed = copy.deepcopy(payload)
     *parents, last = path.split(".")
 
@@ -109,8 +97,6 @@ OBJECT_FIELDS = ["source_account", "source_account.owner", "destination_account"
 
 
 class TestBodyFormat:
-    """O corpo da requisição, antes de ser um Pix."""
-
     @pytest.mark.parametrize(
         "body",
         [
@@ -152,7 +138,6 @@ class TestBodyFormat:
 
     @pytest.mark.parametrize("literal", ["NaN", "Infinity", "-Infinity"])
     def test_numbers_that_are_not_json(self, literal):
-        """NaN e Infinity não existem em JSON, mas o parser do Python aceita. A API não pode."""
         for path in ["amount", "source.geolocation.latitude", "source.geolocation.longitude"]:
             marker = "__NUMERO__"
             body = json.dumps(with_field(valid_payload(), path, marker)).replace(f'"{marker}"', literal)
@@ -161,7 +146,6 @@ class TestBodyFormat:
             assert_client_error(status, response, 400, "QIT000001")
 
     def test_duplicated_keys_keep_working(self):
-        """JSON com chave repetida: vale a última, e a API não quebra."""
         payload = valid_payload()
         body = json.dumps(payload)[:-1] + ', "amount": 7000}'
 
@@ -197,7 +181,6 @@ class TestFieldsMissingOrWrongType:
         ["campo_novo", "source_account.campo_novo", "source_account.owner.level", "destination_account.pix_key", "source.street_mode"],
     )
     def test_field_outside_the_contract(self, path):
-        """O payload é o do desafio, sem nenhum campo a mais."""
         status, response = RequestGenerator.POST_pix_transaction(with_field(valid_payload(), path, "x"))
         assert_client_error(status, response, 400, "QIT000001")
 
@@ -219,7 +202,7 @@ class TestFieldValues:
         [
             "17/10/2026 22:15",
             "2026-10-17",
-            "2026-10-17T22:15:00",  # sem fuso
+            "2026-10-17T22:15:00",
             "2026-10-17 22:15:00-03:00",
             "2026-10-17T22:15-03:00",
             "2026-10-17T22:15:00.1234567-03:00",
@@ -236,15 +219,15 @@ class TestFieldValues:
     @pytest.mark.parametrize(
         "raw_date",
         [
-            "2026-02-30T10:00:00-03:00",  # dia que não existe
-            "2026-13-01T10:00:00-03:00",  # mês que não existe
-            "2026-10-17T24:00:00-03:00",  # hora que não existe
+            "2026-02-30T10:00:00-03:00",
+            "2026-13-01T10:00:00-03:00",
+            "2026-10-17T24:00:00-03:00",
             "2026-10-17T22:60:00-03:00",
-            "2026-10-17T22:15:60-03:00",  # segundo bissexto não existe em Python
-            "2026-10-17T22:15:00+25:00",  # fuso que não existe
-            "0000-01-01T00:00:00-03:00",  # ano zero
-            "0001-01-01T00:00:00+14:00",  # vira ano zero em UTC
-            "9999-12-31T23:59:59-14:00",  # vira ano 10000 em UTC
+            "2026-10-17T22:15:60-03:00",
+            "2026-10-17T22:15:00+25:00",
+            "0000-01-01T00:00:00-03:00",
+            "0001-01-01T00:00:00+14:00",
+            "9999-12-31T23:59:59-14:00",
         ],
     )
     def test_impossible_or_out_of_range_dates(self, path, raw_date):
@@ -256,7 +239,6 @@ class TestFieldValues:
         ["2020-11-15T23:59:59-03:00", "1999-01-01T10:00:00-03:00", "2101-01-01T10:00:00-03:00"],
     )
     def test_transaction_date_outside_the_pix_era(self, raw_date):
-        """O Pix começou a funcionar em 16/11/2020: um Pix antes disso não existe."""
         status, response = RequestGenerator.POST_pix_transaction(with_field(valid_payload(), "transaction_date", raw_date))
         assert_client_error(status, response, 422, "QIT002005")
 
@@ -275,8 +257,8 @@ class TestFieldValues:
             "123456789012",
             "123.456.78909",
             "abc.def.ghi-jk",
-            "١٢٣.٤٥٦.٧٨٩-٠٩",  # dígitos arábicos: \d aceitaria, o contrato não
-            "１２３４５６７８９０９",  # dígitos de largura total
+            "١٢٣.٤٥٦.٧٨٩-٠٩",
+            "１２３４５６７８９０９",
             "123.456.789-09 ",
             "",
         ],
@@ -287,14 +269,12 @@ class TestFieldValues:
 
     @pytest.mark.parametrize("value", ["", "abc", "1234567", "123456789", "١٢٣٤٥٦٧٨", "1234 567"])
     def test_malformed_participant(self, value):
-        """ISPB: exatamente oito dígitos."""
         status, response = RequestGenerator.POST_pix_transaction(with_field(valid_payload(), "destination_account.participant", value))
         assert_client_error(status, response, 400, "QIT000001")
 
     @pytest.mark.parametrize("path", ["source_account.branch", "destination_account.branch"])
     @pytest.mark.parametrize("value", ["", "abc", "12345678901", "١٢٣٤", "12 34"])
     def test_malformed_branch(self, path, value):
-        """Agência: de 1 a 10 dígitos."""
         status, response = RequestGenerator.POST_pix_transaction(with_field(valid_payload(), path, value))
         assert_client_error(status, response, 400, "QIT000001")
 
@@ -303,7 +283,6 @@ class TestFieldValues:
     )
     @pytest.mark.parametrize("value", ["com\u0000nulo", "quebra\nde linha", "tab\tulação", "\u001b[31m"])
     def test_control_characters(self, path, value):
-        """NUL e caracteres de controle: o PostgreSQL nem aceita NUL num texto."""
         status, response = RequestGenerator.POST_pix_transaction(with_field(valid_payload(), path, value))
         assert_client_error(status, response, 400, "QIT000001")
 
@@ -317,7 +296,6 @@ class TestFieldValues:
 
     @pytest.mark.parametrize("pix_id", ["pix/000123", "pix 000123", "pix?x=1", "pix#1", "../../etc", "pix%00", "píx-ç"])
     def test_id_that_could_not_be_queried_later(self, pix_id):
-        """O id volta no endereço do GET: o que não cabe num endereço não pode ser id."""
         status, response = RequestGenerator.POST_pix_transaction(with_field(valid_payload(), "id", pix_id))
         assert_client_error(status, response, 400, "QIT000001")
 
@@ -376,8 +354,6 @@ class TestFieldValues:
 
 
 class TestPathParameters:
-    """O id que vem no endereço do GET e da rota do 2FA."""
-
     @pytest.mark.parametrize(
         "pix_id",
         [
@@ -388,7 +364,7 @@ class TestPathParameters:
             "a" * 5000,
             "%F0%9F%98%80",
             "pix%20000123",
-            "%27%20OR%20%271%27%3D%271",  # ' OR '1'='1
+            "%27%20OR%20%271%27%3D%271",
             "%E2%80%AE",
         ],
     )

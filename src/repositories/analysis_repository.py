@@ -7,8 +7,6 @@ from models import Analysis, AnalysisStatus, PixTransaction, TwoFactorResult
 
 
 class AnalysisRepository:
-    """A decisão do motor. Repare que não existe `update` aqui: a análise é imutável."""
-
     def __init__(self, context: Context) -> None:
         self.session = context.db_session
 
@@ -40,11 +38,6 @@ class AnalysisRepository:
         return self.session.query(AnalysisStatus).filter(AnalysisStatus.enumerator == enumerator).one()
 
     def list_payer_risks(self, document: str, window_start: datetime, transaction_date: datetime) -> List[dict]:
-        """O risco de cada Pix do pagador ainda dentro da validade, com o que aconteceu no 2FA dele.
-
-        É a matéria-prima da memória do risco. Quem decide quanto cada um
-        deixa de herança é o risk_rules: aqui só se busca.
-        """
         rows = (
             self.session.query(PixTransaction.pix_id, Analysis.transaction_risk, TwoFactorResult.result)
             .select_from(Analysis)

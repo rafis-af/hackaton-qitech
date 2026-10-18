@@ -16,9 +16,6 @@ class Analysis(Base):
     inherited_risk = Column(SmallInteger, nullable=False)
     risk_score = Column(SmallInteger, nullable=False)
     decision_reason = Column(String(20), nullable=False)
-    # O nome da coluna é "metadata", mas `metadata` é palavra reservada
-    # das classes do SQLAlchemy (é onde ele guarda a descrição das
-    # tabelas). Por isso o atributo Python tem outro nome.
     analysis_metadata = Column("metadata", JSONB, nullable=False)
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
 

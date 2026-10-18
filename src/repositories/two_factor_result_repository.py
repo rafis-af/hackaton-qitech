@@ -9,7 +9,6 @@ class TwoFactorResultRepository:
         self.session = context.db_session
 
     def create_pending(self, analysis: Analysis, created_at: datetime, expires_at: datetime) -> TwoFactorResult:
-        """Abre a pendência no mesmo instante em que o motor pede o 2FA, já com o prazo."""
         two_factor_result = TwoFactorResult()
 
         two_factor_result.analysis = analysis

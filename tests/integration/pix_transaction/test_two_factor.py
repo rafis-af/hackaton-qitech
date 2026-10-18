@@ -4,10 +4,7 @@ from tests.utils import NIGHTTIME, DbUtils, ObjectGenerator, RandomGenerator, Re
 
 
 class TestTwoFactor:
-    """O banco avisa o que o cliente fez com o 2FA. A decisão do motor nunca muda."""
-
     def test_two_factor_is_born_pending_with_a_deadline(self):
-        """O 2FA pedido já nasce como pendência, com prazo de 3 minutos, visível no POST e no GET."""
         analysis = ObjectGenerator.send_two_factor_pix()
         approved = ObjectGenerator.send_pix(amount=5000)
 
@@ -21,7 +18,6 @@ class TestTwoFactor:
         status, saved = RequestGenerator.GET_pix_transaction(analysis["pix_id"])
         assert saved["metadata"]["two_factor"]["result"] == "pending"
 
-        # Pix que não pediu 2FA não tem pendência nenhuma
         assert approved["status"] == "approved"
         assert "two_factor" not in approved["metadata"]
 
@@ -40,7 +36,6 @@ class TestTwoFactor:
         assert response["metadata"]["two_factor"]["result"] == "confirmed"
 
     def test_answer_after_the_deadline_is_refused(self):
-        """A selfie chegou tarde: a pendência fecha como expirada, e o Pix não sai."""
         analysis = ObjectGenerator.send_two_factor_pix()
         DbUtils.expire_two_factor(analysis["pix_id"])
 
@@ -54,7 +49,6 @@ class TestTwoFactor:
         assert saved["metadata"]["two_factor"]["result"] == "expired"
         assert saved["metadata"]["two_factor"]["resolved_at"] is not None
 
-        # Insistir depois de expirado continua recusado, com o mesmo motivo
         status, response = RequestGenerator.POST_two_factor(analysis["pix_id"], {"result": "confirmed"})
         assert status == 409
         assert response["code"] == "QIT002006"
@@ -92,20 +86,17 @@ class TestTwoFactor:
         assert response["code"] == "QIT000001"
 
     def test_failed_two_factor_passes_the_whole_risk_on(self):
-        """Celular roubado: o golpista tem a senha, mas não o rosto. A dúvida virou suspeita."""
         payer = RandomGenerator.generate_cpf()
         first = ObjectGenerator.send_two_factor_pix(payer_document=payer)
         RequestGenerator.POST_two_factor(first["pix_id"], {"result": "failed"})
 
         next_pix = ObjectGenerator.send_pix(payer_document=payer, transaction_date=NIGHTTIME + timedelta(hours=1))
 
-        # herda os 50 inteiros: noite sem histórico 20 + destino 5 + 50 = 75
         assert ObjectGenerator.risk(next_pix)["inherited_risk"] == 50
         assert ObjectGenerator.risk(next_pix)["inherited_fraction"] == 1.0
         assert next_pix["status"] == "rejected"
 
     def test_confirmed_two_factor_clears_the_doubt(self):
-        """2FA confirmado: a dúvida foi tirada pelo cliente, e o risco daquele Pix não passa adiante."""
         payer = RandomGenerator.generate_cpf()
         first = ObjectGenerator.send_two_factor_pix(payer_document=payer)
         RequestGenerator.POST_two_factor(first["pix_id"], {"result": "confirmed"})

@@ -5,8 +5,6 @@ from models import RiskMetric
 
 
 class Rule(Base):
-    """Um sinal do motor: o que ele viu, e quanto vale. Fato que reprova não tem métrica."""
-
     __tablename__ = "rule"
 
     id = Column(Integer, primary_key=True)

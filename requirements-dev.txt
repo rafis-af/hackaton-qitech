@@ -1,6 +1,3 @@
-# Dependencias que so o desenvolvedor precisa (rodar teste, ler .env).
-# Nao vao para dentro da imagem que sobe em producao.
-
 -r requirements.txt
 
 pytest==7.4.4

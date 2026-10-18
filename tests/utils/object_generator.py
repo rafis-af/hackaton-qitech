@@ -7,7 +7,6 @@ from tests.utils.request_generator import RequestGenerator
 class ObjectGenerator:
     @staticmethod
     def send_pix(**payload_fields) -> dict:
-        """Manda um Pix e devolve a análise. Falha alto se o POST não for 201."""
         payload = PayloadGenerator.create_pix_payload(**payload_fields)
 
         status, response = RequestGenerator.POST_pix_transaction(payload)
@@ -18,12 +17,6 @@ class ObjectGenerator:
 
     @staticmethod
     def send_two_factor_pix(**payload_fields) -> dict:
-        """Um Pix que, para um pagador SEM histórico, pede 2FA: risco 50.
-
-        R$ 1.500 às 22:15 para uma conta aberta há 7 dias:
-        noite sem histórico (20) + valor alto sem histórico (15) + destino
-        novo e conta nova (15) = 50.
-        """
         fields = {
             "amount": 150000,
             "transaction_date": NIGHTTIME,

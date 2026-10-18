@@ -25,31 +25,6 @@ DATABASE_OFFLINE = (
 
 
 class DbUtils:
-    """Apaga o banco inteiro e o recria do zero — quando alguém chama.
-
-    Não existe limpeza automática neste projeto. O `rollback()` roda no
-    teste que o chamar, na linha em que for chamado, e em mais lugar
-    nenhum. Todos os testes dividem o mesmo banco, e cada um enxerga o
-    que os anteriores deixaram pra trás.
-
-    O nome engana um pouco: isto não desfaz uma transação. Ele derruba
-    o schema `public` com tudo que estiver dentro e roda o
-    `database/database.sql` de novo — tabelas vazias e os quatro status
-    do INSERT de volta.
-
-    Quando o seu teste precisa chamar: sempre que alguma asserção
-    depender de QUANTAS linhas existem no banco — contar, listar,
-    paginar, filtrar. Nesses casos `DbUtils.rollback()` é a primeira
-    linha do teste, antes de criar qualquer coisa (o exemplo está em
-    `tests/integration/test_sample_entities.py`). Um teste que só olha
-    as entidades que ele mesmo criou, pela chave que recebeu de volta,
-    não precisa de limpeza nenhuma — e fica mais rápido sem ela.
-
-    A limpeza acontece pela mesma conexão que a aplicação usa (a
-    DATABASE_URL), e não por um programa externo: quem tem Docker
-    rodando já tem tudo que precisa.
-    """
-
     @staticmethod
     def database_url() -> str:
         return environ.get("DATABASE_URL", DEFAULT_DATABASE_URL)
@@ -63,10 +38,6 @@ class DbUtils:
                 for query in RESET_QUERIES:
                     connection.exec_driver_sql(query)
 
-                # Pelo cursor cru do driver, e não pelo exec_driver_sql: o
-                # schema tem "%" em texto ("Menos de 10% dos Pix..."), e o
-                # exec_driver_sql trataria esse % como marcador de parâmetro.
-                # O reset apagaria o schema e não conseguiria recriá-lo.
                 with connection.connection.cursor() as cursor:
                     cursor.execute(SCHEMA_FILE.read_text(encoding="utf-8"))
         except OperationalError:
@@ -77,12 +48,6 @@ class DbUtils:
 
     @staticmethod
     def expire_two_factor(pix_id: str) -> None:
-        """Faz o prazo do 2FA deste Pix já ter passado.
-
-        O prazo é de minutos, e nenhum teste vai esperar isso. Mexer só
-        no expires_at (e no created_at, por causa do CHECK que exige
-        prazo depois da criação) é o mesmo que o relógio ter andado.
-        """
         engine = create_engine(DbUtils.database_url(), isolation_level="AUTOCOMMIT")
 
         try:

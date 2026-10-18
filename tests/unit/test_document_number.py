@@ -12,7 +12,6 @@ class TestDocumentNumber:
         assert not is_valid_document("111.111.111-11")
 
     def test_cnpj(self):
-        # CNPJ de teste conhecido, válido na conta dos dígitos
         assert is_valid_document("11.222.333/0001-81")
         assert not is_valid_document("11.222.333/0001-82")
         assert not is_person("11.222.333/0001-81")

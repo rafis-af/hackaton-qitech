@@ -2,14 +2,6 @@ from errors import QIException
 
 
 class PixTransactionConflict(QIException):
-    """O mesmo `id` de Pix chegou de novo, com outros dados.
-
-    O reenvio com os MESMOS dados não é erro: devolve a análise original
-    com 200. Já um `id` repetido com valor, conta ou data diferentes é
-    outro Pix tentando usar um identificador que já tem dono — e
-    analisá-lo por cima apagaria a decisão anterior.
-    """
-
     code = "QIT002001"
 
     def __init__(self, pix_id) -> None:
@@ -32,8 +24,6 @@ class PixTransactionNotFound(QIException):
 
 
 class TwoFactorNotRequired(QIException):
-    """Só existe resultado de 2FA para Pix em que o motor PEDIU 2FA."""
-
     code = "QIT002003"
 
     def __init__(self, pix_id, status) -> None:
@@ -56,14 +46,6 @@ class TwoFactorAlreadyAnswered(QIException):
 
 
 class TwoFactorExpired(QIException):
-    """A resposta do 2FA chegou depois do prazo.
-
-    409, e não 400: o pedido está bem escrito (400 é "não consegui ler o
-    seu pedido", como diz o Base Service). O que impede é o estado da
-    pendência, que já fechou — a mesma família dos outros dois erros de
-    2FA aqui em cima.
-    """
-
     code = "QIT002006"
 
     def __init__(self, pix_id, expires_at) -> None:
@@ -75,12 +57,6 @@ class TwoFactorExpired(QIException):
 
 
 class InvalidDateTime(QIException):
-    """A data tem o formato certo e não existe no calendário.
-
-    422, e não 400: a API leu o pedido e entendeu, e o valor é que não
-    pode existir.
-    """
-
     code = "QIT002005"
 
     def __init__(self, field, raw_datetime) -> None:

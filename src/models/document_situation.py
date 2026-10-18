@@ -3,8 +3,6 @@ from models.base import Base
 
 
 class DocumentSituation(Base):
-    """O que a Receita respondeu sobre um documento, guardado por um tempo."""
-
     __tablename__ = "document_situation"
 
     id = Column(Integer, primary_key=True)

@@ -4,20 +4,13 @@ from uuid import uuid4
 
 from tests.utils.random_generator import RandomGenerator
 
-# O fuso de Brasília escrito como deslocamento fixo. Os testes montam as
-# datas aqui e o motor converte para São Paulo do lado de lá.
 BRASILIA = timezone(timedelta(hours=-3))
 
-# Uma tarde qualquer, longe do limite noturno. Os testes que precisam de
-# noite pedem explicitamente.
 DAYTIME = datetime(2026, 10, 14, 14, 0, tzinfo=BRASILIA)
 NIGHTTIME = datetime(2026, 10, 14, 22, 15, tzinfo=BRASILIA)
 
 ITAU_ISPB = "60701190"
 
-# Lugares para o Modo Rua. Guarulhos fica a ~17 km do centro de São
-# Paulo (dentro do raio de 30 km); Campinas, a ~85 km; Salvador, a
-# ~1.450 km.
 SAO_PAULO = {"latitude": -23.56, "longitude": -46.65}
 GUARULHOS = {"latitude": -23.45, "longitude": -46.53}
 CAMPINAS = {"latitude": -22.91, "longitude": -47.06}
@@ -31,11 +24,6 @@ def to_iso(moment: datetime) -> str:
 class PayloadGenerator:
     @staticmethod
     def create_destination(opening_date: datetime = None, document_number: str = None) -> dict:
-        """Uma conta de destino nova a cada chamada: cada teste tem as suas.
-
-        Aberta há um ano por padrão, para não disparar a regra de conta
-        nova sem o teste pedir.
-        """
         if opening_date is None:
             opening_date = DAYTIME - timedelta(days=365)
 
@@ -61,21 +49,6 @@ class PayloadGenerator:
         geolocation: dict = SAO_PAULO,
         pix_id: str = None,
     ) -> dict:
-        """Um Pix válido, com qualquer campo trocado a pedido.
-
-        Sem argumento nenhum o pagador é um CPF aleatório: cada teste
-        começa com um pagador sem histórico, e um teste não contamina o
-        risco do outro. Quem testa histórico passa o MESMO pagador nos
-        vários Pix.
-
-        O aparelho e o IP, por padrão, nascem do CPF do pagador: um
-        aparelho por conta, como na premissa do projeto. Um aparelho ou
-        um IP fixo para todos os testes faria a métrica de origem pesar
-        em todos eles.
-
-        A geolocalização é São Paulo por padrão. `geolocation=None` manda
-        o Pix sem ela, como o contrato permite.
-        """
         if transaction_date is None:
             transaction_date = DAYTIME
 
@@ -123,7 +96,6 @@ class PayloadGenerator:
 
     @staticmethod
     def create_challenge_payload(pix_id: str = None) -> dict:
-        """O Pix do exemplo do desafio, campo por campo (só o id muda, para não colidir)."""
         if pix_id is None:
             pix_id = f"pix-{uuid4()}"
 
