@@ -49,8 +49,8 @@ class PayloadGenerator:
         payer_document: str = None,
         destination: dict = None,
         level: str = None,
-        device_id: str = "dvc-teste-1",
-        pix_key: dict = None,
+        device_id: str = None,
+        street_mode: dict = None,
         pix_id: str = None,
     ) -> dict:
         """Um Pix válido, com qualquer campo trocado a pedido.
@@ -59,6 +59,11 @@ class PayloadGenerator:
         começa com um pagador sem histórico, e um teste não contamina o
         score do outro. Quem testa histórico passa o MESMO pagador nos
         vários Pix.
+
+        O aparelho, por padrão, nasce do CPF do pagador: um aparelho por
+        conta, como na premissa do projeto. Um aparelho fixo para todos
+        os testes faria a regra de aparelho compartilhado disparar em
+        todos eles.
         """
         if transaction_date is None:
             transaction_date = DAYTIME
@@ -69,6 +74,9 @@ class PayloadGenerator:
         if destination is None:
             destination = PayloadGenerator.create_destination()
 
+        if device_id is None:
+            device_id = f"dvc-{''.join(character for character in payer_document if character.isdigit())}"
+
         if pix_id is None:
             pix_id = f"pix-{uuid4()}"
 
@@ -76,9 +84,14 @@ class PayloadGenerator:
         if level is not None:
             owner["level"] = level
 
-        destination_account = dict(destination)
-        if pix_key is not None:
-            destination_account["pix_key"] = pix_key
+        source = {
+            "device_id": device_id,
+            "channel": "app",
+            "ip": "198.51.100.23",
+            "geolocation": {"latitude": -23.56, "longitude": -46.65},
+        }
+        if street_mode is not None:
+            source["street_mode"] = street_mode
 
         return {
             "id": pix_id,
@@ -90,13 +103,8 @@ class PayloadGenerator:
                 "opening_date": "2025-03-02T10:00:00-03:00",
                 "owner": owner,
             },
-            "destination_account": destination_account,
-            "source": {
-                "device_id": device_id,
-                "channel": "app",
-                "ip": "198.51.100.23",
-                "geolocation": {"latitude": -23.56, "longitude": -46.65},
-            },
+            "destination_account": destination,
+            "source": source,
         }
 
     @staticmethod

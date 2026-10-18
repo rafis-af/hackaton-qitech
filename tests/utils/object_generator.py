@@ -17,3 +17,7 @@ class ObjectGenerator:
     @staticmethod
     def fired_rules(analysis: dict) -> list:
         return [signal["rule"] for signal in analysis["metadata"]["signals"]]
+
+    @staticmethod
+    def decision(analysis: dict) -> dict:
+        return analysis["metadata"]["decision"]

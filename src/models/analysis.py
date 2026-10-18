@@ -1,4 +1,4 @@
-from sqlalchemy import CHAR, Column, DateTime, ForeignKey, Integer, SmallInteger, UniqueConstraint, func
+from sqlalchemy import CHAR, Column, DateTime, ForeignKey, Integer, SmallInteger, String, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import relationship
 from models.base import Base
@@ -13,6 +13,7 @@ class Analysis(Base):
     pix_transaction_id = Column(Integer, ForeignKey(PixTransaction.id), nullable=False)
     status_id = Column(Integer, ForeignKey(AnalysisStatus.id), nullable=False)
     risk_score = Column(SmallInteger, nullable=False)
+    decision_reason = Column(String(20), nullable=False)
     # O nome da coluna é "metadata", mas `metadata` é palavra reservada
     # das classes do SQLAlchemy (é onde ele guarda a descrição das
     # tabelas). Por isso o atributo Python tem outro nome.
@@ -28,3 +29,7 @@ class Analysis(Base):
     status = relationship("AnalysisStatus", foreign_keys=[status_id], lazy="selectin")
     rule_results = relationship("RuleResult", back_populates="analysis", order_by="asc(RuleResult.id)")
     two_factor_result = relationship("TwoFactorResult", back_populates="analysis", uselist=False, lazy="selectin")
+
+    BLOCKING_RULE = "blocking_rule"
+    RISK_SCORE = "risk_score"
+    TWO_FACTOR_RULE = "two_factor_rule"

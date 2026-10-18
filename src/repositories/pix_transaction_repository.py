@@ -107,7 +107,9 @@ class PixTransactionRepository:
                 .filter(and_(in_short_window, at_night, PixTransaction.amount.between(split_min_amount, split_max_amount)))
                 .label("split_count"),
                 func.coalesce(func.bool_or(and_(same_destination, trusted)), False).label("known_destination"),
-                func.coalesce(func.bool_or(PixTransaction.device_id == device_id), False).label("known_device"),
+                func.coalesce(
+                    func.bool_or(and_(in_short_window, PixTransaction.device_id != device_id)), False
+                ).label("other_device_in_short_window"),
                 func.count(PixTransaction.id)
                 .filter(and_(in_short_window, TwoFactorResult.result == TwoFactorResult.FAILED))
                 .label("failed_two_factor_count"),
@@ -136,11 +138,11 @@ class PixTransactionRepository:
             "sum_short_window": int(row.sum_short_window),
             "split_count": row.split_count,
             "known_destination": row.known_destination,
-            "known_device": row.known_device,
+            "other_device_in_short_window": row.other_device_in_short_window,
             "failed_two_factor_count": row.failed_two_factor_count,
         }
 
-    # As três consultas abaixo estão em SQL escrito, e não no construtor
+    # As duas consultas abaixo estão em SQL escrito, e não no construtor
     # de consultas do SQLAlchemy: UNION e NOT EXISTS ficam mais legíveis
     # assim, e quem for conferir a regra lê a consulta como ela roda.
 
@@ -208,32 +210,30 @@ class PixTransactionRepository:
         }
         return self.session.execute(query, parameters).scalar()
 
-    def count_other_accounts_for_pix_key(
-        self, pix_key_hash: str, window_start: datetime, transaction_date: datetime, destination: dict
-    ) -> int:
-        """Em quantas OUTRAS contas a mesma chave Pix apareceu na janela."""
-        query = text(
-            """
-            SELECT COUNT(*) FROM (
-                SELECT DISTINCT dest_participant, dest_branch, dest_account
-                FROM pix_transaction
-                WHERE pix_key_hash = :pix_key_hash
-                  AND transaction_date > :window_start
-                  AND transaction_date <= :transaction_date
-                  AND NOT (
-                      dest_participant = :participant
-                      AND dest_branch = :branch
-                      AND dest_account = :account
-                  )
-            ) AS other_account
-            """
+    def last_device_id(self, document: str, transaction_date: datetime) -> Optional[str]:
+        """O aparelho do Pix mais recente do pagador antes deste. None se ele nunca fez Pix."""
+        return (
+            self.session.query(PixTransaction.device_id)
+            .filter(
+                PixTransaction.source_document == document,
+                PixTransaction.transaction_date <= transaction_date,
+            )
+            .order_by(PixTransaction.transaction_date.desc(), PixTransaction.id.desc())
+            .limit(1)
+            .scalar()
         )
-        parameters = {
-            "pix_key_hash": pix_key_hash,
-            "window_start": window_start,
-            "transaction_date": transaction_date,
-            "participant": destination["participant"],
-            "branch": destination["branch"],
-            "account": destination["account"],
-        }
-        return self.session.execute(query, parameters).scalar()
+
+    def count_other_payers_on_device(
+        self, device_id: str, window_start: datetime, transaction_date: datetime, document: str
+    ) -> int:
+        """Quantos OUTROS pagadores usaram este mesmo aparelho na janela."""
+        return (
+            self.session.query(func.count(func.distinct(PixTransaction.source_document)))
+            .filter(
+                PixTransaction.device_id == device_id,
+                PixTransaction.source_document != document,
+                PixTransaction.transaction_date > window_start,
+                PixTransaction.transaction_date <= transaction_date,
+            )
+            .scalar()
+        )

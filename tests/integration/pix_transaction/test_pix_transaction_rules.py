@@ -1,6 +1,6 @@
 from datetime import timedelta
 
-from tests.utils import DAYTIME, NIGHTTIME, ObjectGenerator, PayloadGenerator, RandomGenerator
+from tests.utils import DAYTIME, NIGHTTIME, ObjectGenerator, PayloadGenerator, RandomGenerator, RequestGenerator
 
 RESTRICTED_DOCUMENT = "529.982.247-25"  # está no seed de restricted_party do database.sql
 
@@ -13,16 +13,23 @@ class TestBlockingRules:
         analysis = ObjectGenerator.send_pix(destination=destination)
 
         assert analysis["status"] == "rejected"
-        assert analysis["metadata"]["decision_reason"] == "blocking_rule"
-        assert "invalid_document_number" in ObjectGenerator.fired_rules(analysis)
+        assert ObjectGenerator.decision(analysis)["reason"] == "blocking_rule"
+        assert ObjectGenerator.decision(analysis)["rules"] == ["invalid_document_number"]
 
-    def test_restricted_destination_is_rejected(self):
+    def test_rejected_pix_is_recorded_with_the_reason(self):
+        """O Pix barrado fica gravado, e o GET diz por que ele foi barrado."""
         destination = PayloadGenerator.create_destination(document_number=RESTRICTED_DOCUMENT)
 
         analysis = ObjectGenerator.send_pix(destination=destination)
+        status, saved = RequestGenerator.GET_pix_transaction(analysis["pix_id"])
 
-        assert analysis["status"] == "rejected"
-        assert "restricted_destination" in ObjectGenerator.fired_rules(analysis)
+        assert status == 200
+        assert saved["status"] == "rejected"
+        assert ObjectGenerator.decision(saved) == {
+            "reason": "blocking_rule",
+            "rules": ["restricted_destination"],
+            "description": "Reprovado por regra de bloqueio: Quem recebe está na lista restritiva",
+        }
 
     def test_silver_over_daily_limit_is_rejected_but_gold_is_not(self):
         silver = ObjectGenerator.send_pix(amount=150000, level="silver")
@@ -35,19 +42,76 @@ class TestBlockingRules:
         assert gold["status"] == "two_factor_required"
         assert ObjectGenerator.fired_rules(gold) == ["payer_without_history"]
 
-    def test_cpf_key_of_someone_else_is_rejected(self):
-        destination = PayloadGenerator.create_destination()
-        someone_else = RandomGenerator.generate_cpf()
 
-        analysis = ObjectGenerator.send_pix(destination=destination, pix_key={"type": "cpf", "value": someone_else})
-        own_key = ObjectGenerator.send_pix(
-            destination=destination,
-            pix_key={"type": "cpf", "value": destination["owner"]["document_number"]},
-        )
+class TestStreetMode:
+    """O Modo Rua: o app avisa que o celular saiu das redes Wi-Fi que o cliente cadastrou."""
+
+    def test_without_limit_every_pix_asks_two_factor(self):
+        analysis = ObjectGenerator.send_pix(amount=1000, street_mode={"active": True})
+
+        assert analysis["status"] == "two_factor_required"
+        assert ObjectGenerator.decision(analysis)["reason"] == "two_factor_rule"
+        assert ObjectGenerator.decision(analysis)["rules"] == ["street_mode"]
+        # Fricção, não comportamento suspeito: não soma ponto
+        assert analysis["metadata"]["risk_score"] == 0
+
+    def test_with_limit_only_above_it_asks_two_factor(self):
+        street_mode = {"active": True, "limit": 10000}
+
+        below = ObjectGenerator.send_pix(amount=10000, street_mode=street_mode)
+        above = ObjectGenerator.send_pix(amount=10001, street_mode=street_mode)
+
+        assert below["status"] == "approved"
+        assert above["status"] == "two_factor_required"
+        assert "street_mode" in ObjectGenerator.fired_rules(above)
+
+    def test_inactive_or_absent_changes_nothing(self):
+        at_home = ObjectGenerator.send_pix(amount=10000, street_mode={"active": False})
+        not_informed = ObjectGenerator.send_pix(amount=10000)
+
+        assert at_home["status"] == "approved"
+        assert not_informed["status"] == "approved"
+
+    def test_street_mode_never_saves_a_rejected_pix(self):
+        destination = PayloadGenerator.create_destination(document_number=RESTRICTED_DOCUMENT)
+
+        analysis = ObjectGenerator.send_pix(destination=destination, street_mode={"active": True})
 
         assert analysis["status"] == "rejected"
-        assert "pix_key_document_mismatch" in ObjectGenerator.fired_rules(analysis)
-        assert own_key["status"] == "approved"
+
+
+class TestOneDevicePerAccount:
+    """Premissa do projeto: um aparelho por conta e uma conta por aparelho."""
+
+    def test_device_change_weighs_for_the_next_hours(self):
+        payer = RandomGenerator.generate_cpf()
+        old_phone = f"antigo-{payer}"
+        new_phone = f"novo-{payer}"
+
+        ObjectGenerator.send_pix(payer_document=payer, device_id=old_phone)
+        swapped = ObjectGenerator.send_pix(
+            payer_document=payer, device_id=new_phone, transaction_date=DAYTIME + timedelta(hours=1)
+        )
+        same_day = ObjectGenerator.send_pix(
+            payer_document=payer, device_id=new_phone, transaction_date=DAYTIME + timedelta(hours=2)
+        )
+        two_days_later = ObjectGenerator.send_pix(
+            payer_document=payer, device_id=new_phone, transaction_date=DAYTIME + timedelta(days=2)
+        )
+
+        assert "device_changed" in ObjectGenerator.fired_rules(swapped)
+        assert "device_changed" in ObjectGenerator.fired_rules(same_day)
+        assert "device_changed" not in ObjectGenerator.fired_rules(two_days_later)
+
+    def test_same_device_on_another_account(self):
+        device_id = f"celular-{RandomGenerator.generate_cpf()}"
+
+        first_owner = ObjectGenerator.send_pix(device_id=device_id)
+        second_account = ObjectGenerator.send_pix(device_id=device_id, transaction_date=DAYTIME + timedelta(hours=1))
+
+        assert "device_shared" not in ObjectGenerator.fired_rules(first_owner)
+        assert "device_shared" in ObjectGenerator.fired_rules(second_account)
+        assert second_account["status"] == "two_factor_required"
 
 
 class TestScore:
@@ -67,6 +131,10 @@ class TestScore:
                 transaction_date=NIGHTTIME + timedelta(minutes=minute),
             )
             results.append((analysis["status"], analysis["metadata"]["risk_score"]))
+
+        # O reprovado diz que foi o score, e quais regras deste Pix o levaram a 5.
+        assert ObjectGenerator.decision(analysis)["reason"] == "risk_score"
+        assert ObjectGenerator.decision(analysis)["rules"] == ["many_new_destinations", "split_below_night_limit"]
 
         assert results == [
             ("two_factor_required", 0),  # primeiro Pix: falta de dado, não ponto
@@ -126,22 +194,3 @@ class TestScore:
         assert "destination_many_payers" not in ObjectGenerator.fired_rules(analyses[3])
         assert "destination_many_payers" in ObjectGenerator.fired_rules(analyses[4])
         assert analyses[4]["status"] == "two_factor_required"
-
-    def test_same_pix_key_on_another_account(self):
-        pix_key = {"type": "evp", "value": f"chave-{RandomGenerator.generate_cpf()}"}
-
-        first = ObjectGenerator.send_pix(pix_key=pix_key)
-        moved = ObjectGenerator.send_pix(pix_key=pix_key, transaction_date=DAYTIME + timedelta(hours=1))
-
-        assert "pix_key_moved_account" not in ObjectGenerator.fired_rules(first)
-        assert "pix_key_moved_account" in ObjectGenerator.fired_rules(moved)
-
-    def test_new_device_on_payer_with_history(self):
-        payer = RandomGenerator.generate_cpf()
-
-        ObjectGenerator.send_pix(payer_document=payer, device_id="celular-de-sempre")
-        other_device = ObjectGenerator.send_pix(
-            payer_document=payer, device_id="celular-novo", transaction_date=DAYTIME + timedelta(hours=1)
-        )
-
-        assert "new_device" in ObjectGenerator.fired_rules(other_device)

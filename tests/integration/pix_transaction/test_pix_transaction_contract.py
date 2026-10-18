@@ -80,6 +80,11 @@ class TestPixTransactionContract:
             "night_limit",
             "new_destination_account",
         ]
+        assert ObjectGenerator.decision(response) == {
+            "reason": "risk_score",
+            "rules": ["night_limit", "new_destination_account"],
+            "description": "2FA pedido: score de risco 3 de 5: 0 ponto(s) dos últimos 7 dias + 3 deste Pix",
+        }
 
     def test_get_returns_the_saved_analysis(self):
         analysis = ObjectGenerator.send_pix()

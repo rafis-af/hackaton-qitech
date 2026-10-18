@@ -43,7 +43,7 @@ class PixTransactionController(BaseController):
         """A ordem dos passos é a regra, e cada um tem um porquê:
 
           1. o mesmo `id` já chegou?   antes de tudo: reenvio não roda regra
-          2. normaliza                 documentos só com dígitos, chave em hash
+          2. normaliza                 documentos só com dígitos
           3. trava o pagador           Pix simultâneos dele passam um por vez
           4. o `id` chegou de novo?    alguém igual pode ter gravado enquanto
                                        este esperava a trava
@@ -81,13 +81,17 @@ class PixTransactionController(BaseController):
 
         decision = risk_rules.decide(signals, previous_points)
 
-        self.logger.info(f"Pix {pix_id}: {decision['status']} (score {decision['risk_score']}, {len(signals)} regras)")
+        self.logger.info(f"Pix {pix_id}: {decision['description']}")
 
+        # Grava SEMPRE, inclusive o reprovado: todo Pix que chega fica no
+        # histórico com o motivo da decisão. Uma tentativa barrada também
+        # é comportamento, e pesa nos próximos Pix do pagador.
         pix_transaction = self.pix_transaction_repository.create(pix_data)
         analysis = self.analysis_repository.create(
             pix_transaction=pix_transaction,
             status_enumerator=decision["status"],
             risk_score=decision["risk_score"],
+            decision_reason=decision["reason"],
             metadata=self._build_metadata(decision, signals),
         )
 
@@ -217,30 +221,24 @@ class PixTransactionController(BaseController):
                 "destination_account.opening_date", destination_account["opening_date"]
             ),
             "dest_document": only_digits(destination_account["owner"]["document_number"]),
-            "pix_key_type": None,
-            "pix_key_hash": None,
-            "pix_key_created_at": None,
             "device_id": source["device_id"],
             "channel": source["channel"],
             "ip": source["ip"],
             "latitude": None,
             "longitude": None,
+            "street_mode_active": None,
+            "street_mode_limit": None,
         }
-
-        pix_key = destination_account.get("pix_key")
-        if pix_key is not None:
-            pix_data["pix_key_type"] = pix_key["type"]
-            pix_data["pix_key_hash"] = self._hash_pix_key(pix_key["type"], pix_key["value"])
-
-            if pix_key.get("created_at") is not None:
-                pix_data["pix_key_created_at"] = clock.parse_datetime(
-                    "destination_account.pix_key.created_at", pix_key["created_at"]
-                )
 
         geolocation = source.get("geolocation")
         if geolocation is not None:
             pix_data["latitude"] = geolocation["latitude"]
             pix_data["longitude"] = geolocation["longitude"]
+
+        street_mode = source.get("street_mode")
+        if street_mode is not None:
+            pix_data["street_mode_active"] = street_mode["active"]
+            pix_data["street_mode_limit"] = street_mode.get("limit")
 
         return pix_data
 
@@ -275,27 +273,14 @@ class PixTransactionController(BaseController):
             split_max_amount=risk_rules.SPLIT_MAX_AMOUNT,
         )
 
-        pix_key_other_accounts = 0
-        if pix_data["pix_key_hash"] is not None:
-            pix_key_other_accounts = self.pix_transaction_repository.count_other_accounts_for_pix_key(
-                pix_data["pix_key_hash"],
-                transaction_date - timedelta(days=risk_rules.PIX_KEY_WINDOW_DAYS),
-                transaction_date,
-                destination,
-            )
-
         restricted_party = self.restricted_party_repository.get_by_document(pix_data["dest_document"])
         restricted_reason = None
         if restricted_party is not None:
             restricted_reason = restricted_party.reason
 
-        pix_key = None
-        if pix_data["pix_key_type"] is not None:
-            pix_key = {
-                "type": pix_data["pix_key_type"],
-                "belongs_to_destination_owner": self._pix_key_belongs_to_destination_owner(pix_data),
-                "created_at": pix_data["pix_key_created_at"],
-            }
+        street_mode = None
+        if pix_data["street_mode_active"] is not None:
+            street_mode = {"active": pix_data["street_mode_active"], "limit": pix_data["street_mode_limit"]}
 
         return {
             "amount": pix_data["amount"],
@@ -313,7 +298,7 @@ class PixTransactionController(BaseController):
                 "opening_date": pix_data["dest_opening_date"],
                 "restricted_reason": restricted_reason,
             },
-            "pix_key": pix_key,
+            "street_mode": street_mode,
             "history": history,
             "new_destinations": self.pix_transaction_repository.count_new_destinations(
                 document, short_window_start, transaction_date, destination
@@ -321,14 +306,29 @@ class PixTransactionController(BaseController):
             "destination_payers": self.pix_transaction_repository.count_destination_payers(
                 destination, short_window_start, transaction_date, document
             ),
-            "pix_key_other_accounts": pix_key_other_accounts,
+            "last_device_id": self.pix_transaction_repository.last_device_id(document, transaction_date),
+            "other_payers_on_device": self.pix_transaction_repository.count_other_payers_on_device(
+                pix_data["device_id"],
+                transaction_date - timedelta(days=risk_rules.DEVICE_SHARED_WINDOW_DAYS),
+                transaction_date,
+                document,
+            ),
         }
 
     def _build_metadata(self, decision: dict, signals: list) -> dict:
-        """O "motivo explicável" do desafio: o score, de onde ele veio, e o que cada regra viu."""
+        """O "motivo explicável" do desafio: por que saiu este status, o score e o que cada regra viu.
+
+        `decision` responde a pergunta de quem abre a análise ("por que foi
+        barrado?") sem precisar ler a lista inteira de sinais: o passo que
+        decidiu, as regras que causaram a decisão e uma frase legível.
+        """
         return {
             "risk_score": decision["risk_score"],
-            "decision_reason": decision["reason"],
+            "decision": {
+                "reason": decision["reason"],
+                "rules": decision["decisive_rules"],
+                "description": decision["description"],
+            },
             "score": {
                 "previous_points": decision["previous_points"],
                 "points_from_this_pix": decision["points_from_this_pix"],
@@ -338,19 +338,6 @@ class PixTransactionController(BaseController):
             "signals": signals,
         }
 
-    def _pix_key_belongs_to_destination_owner(self, pix_data: dict) -> Optional[bool]:
-        """Para chave CPF/CNPJ: a chave é o documento do dono da conta?
-
-        O valor da chave não fica guardado em lugar nenhum, nem aqui: para
-        comparar, basta passar o documento do dono pelo mesmo hash. Chave
-        de e-mail, telefone ou aleatória não diz de quem é — None.
-        """
-        if pix_data["pix_key_type"] not in risk_rules.PERSON_KEY_TYPES:
-            return None
-
-        owner_hash = self._hash_pix_key(pix_data["pix_key_type"], pix_data["dest_document"])
-        return pix_data["pix_key_hash"] == owner_hash
-
     def _hash_payload(self, payload: dict) -> str:
         """A impressão digital do pedido, para reconhecer o reenvio.
 
@@ -359,16 +346,3 @@ class PixTransactionController(BaseController):
         """
         canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
         return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-
-    def _hash_pix_key(self, key_type: str, key_value: str) -> str:
-        """O hash da chave, depois de escrever ela de um jeito só.
-
-        Sem normalizar, "Fulano@Email.com" e "fulano@email.com" seriam
-        duas chaves, e a regra de chave que mudou de conta não veria nada.
-        """
-        if key_type in risk_rules.PERSON_KEY_TYPES:
-            normalized = only_digits(key_value)
-        else:
-            normalized = key_value.strip().lower()
-
-        return hashlib.sha256(f"{key_type}:{normalized}".encode("utf-8")).hexdigest()

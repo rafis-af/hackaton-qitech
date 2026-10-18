@@ -26,7 +26,7 @@ def make_facts(**overrides) -> dict:
             "opening_date": DAYTIME - timedelta(days=365),
             "restricted_reason": None,
         },
-        "pix_key": None,
+        "street_mode": None,
         "history": {
             "pix_count": 10,
             "accepted_count": 10,
@@ -35,12 +35,13 @@ def make_facts(**overrides) -> dict:
             "sum_short_window": 0,
             "split_count": 0,
             "known_destination": True,
-            "known_device": True,
+            "other_device_in_short_window": False,
             "failed_two_factor_count": 0,
         },
         "new_destinations": 0,
         "destination_payers": 1,
-        "pix_key_other_accounts": 0,
+        "last_device_id": "dvc-1",
+        "other_payers_on_device": 0,
     }
 
     for key, value in overrides.items():
@@ -53,7 +54,9 @@ def make_facts(**overrides) -> dict:
 
 
 def rule(enumerator: str, action: str = "score", points: int = 1) -> SimpleNamespace:
-    return SimpleNamespace(enumerator=enumerator, family="test", action=action, points=points)
+    return SimpleNamespace(
+        enumerator=enumerator, family="test", action=action, points=points, description=f"descrição de {enumerator}"
+    )
 
 
 def fires(check, **overrides) -> bool:
@@ -101,6 +104,21 @@ class TestRulesAtTheEdge:
         assert not fires(check, history=no_history, amount=20000)
         assert not fires(check, amount=900000)
 
+    def test_street_mode_without_limit_asks_every_pix(self):
+        check = risk_rules.check_street_mode
+
+        assert fires(check, street_mode={"active": True, "limit": None}, amount=1)
+        assert not fires(check, street_mode={"active": False, "limit": None}, amount=900000)
+        # Sem o campo no payload, o Modo Rua não existe para este Pix
+        assert not fires(check, street_mode=None, amount=900000)
+
+    def test_street_mode_with_limit_asks_only_above_it(self):
+        check = risk_rules.check_street_mode
+        street_mode = {"active": True, "limit": 20000}
+
+        assert not fires(check, street_mode=street_mode, amount=20000)
+        assert fires(check, street_mode=street_mode, amount=20001)
+
     def test_split_counts_this_pix_too(self):
         check = risk_rules.check_split_below_night_limit
 
@@ -128,11 +146,21 @@ class TestRulesAtTheEdge:
         assert not fires(check, amount=60000, history={"sum_short_window": 30000})
         assert fires(check, amount=60000, history={"sum_short_window": 40001})
 
-    def test_new_device_needs_history(self):
-        check = risk_rules.check_new_device
+    def test_device_changed_now_and_in_the_next_hours(self):
+        check = risk_rules.check_device_changed
 
-        assert fires(check, history={"known_device": False})
-        assert not fires(check, history={"known_device": False, "pix_count": 0})
+        # o último Pix foi de outro aparelho: a troca é agora
+        assert fires(check, last_device_id="dvc-antigo")
+        # o último já foi deste aparelho, mas houve outro nas últimas 24h
+        assert fires(check, history={"other_device_in_short_window": True})
+        # mesmo aparelho de sempre
+        assert not fires(check)
+        # primeiro Pix da vida: não há aparelho antigo para comparar
+        assert not fires(check, last_device_id=None)
+
+    def test_device_shared_with_another_payer(self):
+        assert fires(risk_rules.check_device_shared, other_payers_on_device=1)
+        assert not fires(risk_rules.check_device_shared, other_payers_on_device=0)
 
     def test_new_destination_account_is_under_thirty_days(self):
         check = risk_rules.check_new_destination_account
@@ -145,21 +173,8 @@ class TestRulesAtTheEdge:
         assert not fires(risk_rules.check_many_new_destinations, new_destinations=4)
         assert fires(risk_rules.check_destination_many_payers, destination_payers=5)
         assert not fires(risk_rules.check_destination_many_payers, destination_payers=4)
-        assert fires(risk_rules.check_pix_key_moved_account, pix_key_other_accounts=1)
         assert fires(risk_rules.check_restricted_destination, destination={"restricted_reason": "confirmed_fraud"})
         assert fires(risk_rules.check_two_factor_failed_recently, history={"failed_two_factor_count": 1})
-
-    def test_pix_key_rules(self):
-        new_key = {"type": "evp", "belongs_to_destination_owner": None, "created_at": DAYTIME - timedelta(hours=2)}
-        old_key = {"type": "evp", "belongs_to_destination_owner": None, "created_at": DAYTIME - timedelta(days=2)}
-        someone_elses_cpf = {"type": "cpf", "belongs_to_destination_owner": False, "created_at": None}
-        own_cpf = {"type": "cpf", "belongs_to_destination_owner": True, "created_at": None}
-
-        assert fires(risk_rules.check_pix_key_recently_created, pix_key=new_key)
-        assert not fires(risk_rules.check_pix_key_recently_created, pix_key=old_key)
-        assert fires(risk_rules.check_pix_key_document_mismatch, pix_key=someone_elses_cpf)
-        assert not fires(risk_rules.check_pix_key_document_mismatch, pix_key=own_cpf)
-        assert not fires(risk_rules.check_pix_key_document_mismatch, pix_key=new_key)
 
     def test_invalid_document_names_the_field(self):
         observed = risk_rules.check_invalid_document_number(make_facts(destination={"document_is_valid": False}))
@@ -167,8 +182,11 @@ class TestRulesAtTheEdge:
 
 
 class TestDecision:
-    def signal(self, action: str, points: int = 0) -> dict:
-        return {"rule": "x", "family": "test", "action": action, "points": points, "observed": {}}
+    def signal(self, action: str, points: int = 0, name: str = "x") -> dict:
+        return {
+            "rule": name, "family": "test", "action": action, "points": points,
+            "description": f"descrição de {name}", "observed": {},
+        }
 
     def test_score_bands(self):
         assert risk_rules.decide([], 0)["status"] == "approved"
@@ -184,17 +202,32 @@ class TestDecision:
         assert decision["points_from_this_pix"] == 4
         assert decision["status"] == "rejected"
 
-    def test_blocking_rule_wins_even_with_zero_score(self):
-        decision = risk_rules.decide([self.signal("reject")], 0)
+    def test_blocking_rule_names_who_blocked(self):
+        decision = risk_rules.decide(
+            [self.signal("reject", name="restricted_destination"), self.signal("score", 1, name="night_limit")], 0
+        )
 
         assert decision["status"] == "rejected"
         assert decision["reason"] == "blocking_rule"
+        assert decision["decisive_rules"] == ["restricted_destination"]
+        assert decision["description"] == "Reprovado por regra de bloqueio: descrição de restricted_destination"
 
-    def test_missing_data_only_raises_approved_to_two_factor(self):
-        """Falta de dado vira fricção: nunca soma ponto, nunca reprova, nunca livra ninguém."""
-        assert risk_rules.decide([self.signal("two_factor")], 0)["status"] == "two_factor_required"
-        assert risk_rules.decide([self.signal("two_factor")], 0)["risk_score"] == 0
-        assert risk_rules.decide([self.signal("two_factor")], 5)["status"] == "rejected"
+    def test_rejected_by_score_names_the_rules_of_this_pix(self):
+        decision = risk_rules.decide([self.signal("score", 2, name="split_below_night_limit")], 4)
+
+        assert decision["reason"] == "risk_score"
+        assert decision["decisive_rules"] == ["split_below_night_limit"]
+        assert decision["description"].startswith("Reprovado: score de risco 5 de 5")
+
+    def test_two_factor_rules_only_raise_approved(self):
+        """Falta de dado e Modo Rua viram fricção: nunca somam ponto, nunca reprovam, nunca livram ninguém."""
+        street = [self.signal("two_factor", name="street_mode")]
+
+        assert risk_rules.decide(street, 0)["status"] == "two_factor_required"
+        assert risk_rules.decide(street, 0)["reason"] == "two_factor_rule"
+        assert risk_rules.decide(street, 0)["decisive_rules"] == ["street_mode"]
+        assert risk_rules.decide(street, 0)["risk_score"] == 0
+        assert risk_rules.decide(street, 5)["status"] == "rejected"
 
     def test_challenge_example_asks_two_factor(self):
         """O Pix do desafio, sem histórico: R$ 1.500 às 22:15 para conta de 7 dias.
@@ -211,15 +244,15 @@ class TestDecision:
                 "accepted_count": 0,
                 "average_ticket": None,
                 "known_destination": False,
-                "known_device": False,
             },
+            last_device_id=None,
             new_destinations=1,
         )
         catalog = [
             rule("unknown_level_daily_limit", "two_factor", 0),
             rule("payer_without_history", "two_factor", 0),
             rule("night_limit", "score", 2),
-            rule("new_device", "score", 1),
+            rule("device_changed", "score", 1),
             rule("new_destination_account", "score", 1),
             rule("amount_above_profile", "score", 2),
         ]

@@ -10,13 +10,21 @@ class AnalysisRepository:
     def __init__(self, context: Context) -> None:
         self.session = context.db_session
 
-    def create(self, pix_transaction: PixTransaction, status_enumerator: str, risk_score: int, metadata: dict) -> Analysis:
+    def create(
+        self,
+        pix_transaction: PixTransaction,
+        status_enumerator: str,
+        risk_score: int,
+        decision_reason: str,
+        metadata: dict,
+    ) -> Analysis:
         analysis = Analysis()
 
         analysis.analysis_key = str(uuid4())
         analysis.pix_transaction = pix_transaction
         analysis.status = self.get_status(status_enumerator)
         analysis.risk_score = risk_score
+        analysis.decision_reason = decision_reason
         analysis.analysis_metadata = metadata
 
         self.session.add(analysis)

@@ -17,13 +17,15 @@ OS TRÊS TIPOS DE REGRA (a coluna `rule.action`)
 • reject      — o risco é claro sem precisar de histórico: documento que
                 não existe, destino na lista restritiva, cliente Prata
                 passando do limite. Reprova direto.
-• two_factor  — FALTA DE DADO. Pagador sem histórico, nível não
-                informado. Não é comportamento suspeito, então não soma
-                ponto e nunca reprova: só pede confirmação.
+• two_factor  — FALTA DE DADO (pagador sem histórico, nível não
+                informado) ou uma condição que o PRÓPRIO CLIENTE ligou
+                (o Modo Rua). Nada disso é comportamento suspeito, então
+                não soma ponto e nunca reprova: só pede confirmação.
 • score       — COMPORTAMENTO. Soma pontos, e os pontos ficam 7 dias.
 
 A separação entre as duas últimas é o que impede o motor de punir quem
-só é novo. Faltar dado vira fricção; comportamento suspeito vira ponto.
+só é novo, ou quem só está na rua. Fricção não deixa marca; comportamento
+suspeito vira ponto.
 
 ────────────────────────────────────────────────────────────────────
 POR QUE FUNÇÕES PURAS
@@ -41,7 +43,7 @@ porquê escrito.
 from datetime import timedelta
 from typing import Callable, Dict, List, Optional
 
-from models import AnalysisStatus, Rule
+from models import Analysis, AnalysisStatus, Rule
 
 # ────────────────────────────────────────────────────────────────────
 # Os parâmetros, cada um com o seu porquê
@@ -90,10 +92,16 @@ DAILY_SUM_MIN_AMOUNT = 100000  # abaixo de R$ 1.000 no dia, 5x o ticket ainda é
 # Contraparte
 NEW_ACCOUNT_DAYS = 30                  # conta laranja costuma ser aberta para o golpe
 DESTINATION_PAYERS_THRESHOLD = 5       # muitas vítimas pagando a mesma conta
-PIX_KEY_NEW_HOURS = 24                 # chave criada para receber este Pix
-PIX_KEY_WINDOW_DAYS = 30               # a mesma chave em outra conta: portabilidade usada em golpe
 
-PERSON_KEY_TYPES = ["cpf", "cnpj"]
+# Aparelho. Premissa do projeto: o banco libera UM aparelho por conta e
+# UMA conta por aparelho. Para o antifraude, isso dá dois sinais:
+#  • aparelho trocado — a conta passou para outro celular. É legítimo
+#    (celular novo, quebrado), mas é também o golpe da troca de aparelho;
+#    por isso pesa nas 24 horas seguintes à troca.
+#  • aparelho compartilhado — o mesmo celular aparecendo em outra conta
+#    quebra a premissa: app adulterado ou identificador clonado.
+DEVICE_CHANGE_WINDOW_HOURS = SHORT_WINDOW_HOURS
+DEVICE_SHARED_WINDOW_DAYS = 30
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -124,18 +132,6 @@ def check_restricted_destination(facts: dict) -> Optional[dict]:
     return {"reason": reason}
 
 
-def check_pix_key_document_mismatch(facts: dict) -> Optional[dict]:
-    pix_key = facts["pix_key"]
-
-    if pix_key is None or pix_key["type"] not in PERSON_KEY_TYPES:
-        return None
-
-    if pix_key["belongs_to_destination_owner"]:
-        return None
-
-    return {"pix_key_type": pix_key["type"]}
-
-
 def check_silver_daily_limit_exceeded(facts: dict) -> Optional[dict]:
     if facts["payer"]["level"] != "silver":
         return None
@@ -163,6 +159,27 @@ def check_payer_without_history(facts: dict) -> Optional[dict]:
         return None
 
     return {"amount": facts["amount"], "threshold": NEW_PAYER_FREE_AMOUNT, "history_days": HISTORY_DAYS}
+
+
+def check_street_mode(facts: dict) -> Optional[dict]:
+    """O Modo Rua: o cliente saiu das redes Wi-Fi que ele cadastrou no app.
+
+    Quem cadastra as redes e percebe que o celular saiu delas é o app; o
+    antifraude recebe só o resultado. Com o modo ativo, o Pix pede 2FA:
+    todos, se o cliente não escolheu limite, ou só os acima do limite.
+    Celular roubado na rua passa a exigir a selfie do dono.
+    """
+    street_mode = facts["street_mode"]
+
+    if street_mode is None or not street_mode["active"]:
+        return None
+
+    limit = street_mode["limit"]
+
+    if limit is not None and facts["amount"] <= limit:
+        return None
+
+    return {"amount": facts["amount"], "limit": limit}
 
 
 def check_night_limit(facts: dict) -> Optional[dict]:
@@ -247,18 +264,35 @@ def check_daily_sum_above_profile(facts: dict) -> Optional[dict]:
     }
 
 
-def check_new_device(facts: dict) -> Optional[dict]:
-    """Aparelho nunca visto, em quem já tem histórico: o sinal da conta tomada.
+def check_device_changed(facts: dict) -> Optional[dict]:
+    """A conta passou para outro aparelho: agora, ou nas últimas 24 horas.
 
-    Pagador sem histórico não dispara: para ele todo aparelho é novo, e
-    essa falta de dado já é tratada pelo payer_without_history.
+    Com um aparelho por conta, aparelho diferente do último quer dizer
+    que a conta foi ativada num celular novo. O sinal continua nas 24
+    horas seguintes, e não só no primeiro Pix depois da troca: o golpe
+    da troca de aparelho esvazia a conta em sequência.
+
+    Pagador sem nenhum Pix anterior não dispara: não há aparelho antigo
+    para comparar, e essa falta de dado é do payer_without_history.
     """
-    history = facts["history"]
+    last_device_id = facts["last_device_id"]
 
-    if history["pix_count"] == 0 or history["known_device"]:
+    changed_now = last_device_id is not None and last_device_id != facts["device_id"]
+    changed_recently = facts["history"]["other_device_in_short_window"]
+
+    if not changed_now and not changed_recently:
         return None
 
-    return {"device_id": facts["device_id"]}
+    return {"previous_device_id": last_device_id, "window_hours": DEVICE_CHANGE_WINDOW_HOURS}
+
+
+def check_device_shared(facts: dict) -> Optional[dict]:
+    other_payers = facts["other_payers_on_device"]
+
+    if other_payers == 0:
+        return None
+
+    return {"other_payers": other_payers, "window_days": DEVICE_SHARED_WINDOW_DAYS}
 
 
 def check_new_destination_account(facts: dict) -> Optional[dict]:
@@ -279,29 +313,6 @@ def check_destination_many_payers(facts: dict) -> Optional[dict]:
     return {"value": payers, "threshold": DESTINATION_PAYERS_THRESHOLD, "window_hours": SHORT_WINDOW_HOURS}
 
 
-def check_pix_key_recently_created(facts: dict) -> Optional[dict]:
-    pix_key = facts["pix_key"]
-
-    if pix_key is None or pix_key["created_at"] is None:
-        return None
-
-    key_age = facts["transaction_date"] - pix_key["created_at"]
-
-    if key_age >= timedelta(hours=PIX_KEY_NEW_HOURS):
-        return None
-
-    return {"key_age_hours": int(key_age.total_seconds() // 3600), "threshold_hours": PIX_KEY_NEW_HOURS}
-
-
-def check_pix_key_moved_account(facts: dict) -> Optional[dict]:
-    other_accounts = facts["pix_key_other_accounts"]
-
-    if other_accounts == 0:
-        return None
-
-    return {"other_accounts": other_accounts, "window_days": PIX_KEY_WINDOW_DAYS}
-
-
 def check_two_factor_failed_recently(facts: dict) -> Optional[dict]:
     failures = facts["history"]["failed_two_factor_count"]
 
@@ -317,20 +328,19 @@ def check_two_factor_failed_recently(facts: dict) -> Optional[dict]:
 RULE_CHECKS: Dict[str, Callable[[dict], Optional[dict]]] = {
     "invalid_document_number": check_invalid_document_number,
     "restricted_destination": check_restricted_destination,
-    "pix_key_document_mismatch": check_pix_key_document_mismatch,
     "silver_daily_limit_exceeded": check_silver_daily_limit_exceeded,
     "unknown_level_daily_limit": check_unknown_level_daily_limit,
     "payer_without_history": check_payer_without_history,
+    "street_mode": check_street_mode,
     "night_limit": check_night_limit,
     "many_new_destinations": check_many_new_destinations,
     "split_below_night_limit": check_split_below_night_limit,
     "amount_above_profile": check_amount_above_profile,
-    "new_device": check_new_device,
+    "device_changed": check_device_changed,
+    "device_shared": check_device_shared,
     "daily_sum_above_profile": check_daily_sum_above_profile,
     "new_destination_account": check_new_destination_account,
     "destination_many_payers": check_destination_many_payers,
-    "pix_key_recently_created": check_pix_key_recently_created,
-    "pix_key_moved_account": check_pix_key_moved_account,
     "two_factor_failed_recently": check_two_factor_failed_recently,
 }
 
@@ -360,6 +370,7 @@ def evaluate(rules: list, facts: dict) -> List[dict]:
                 "family": rule.family,
                 "action": rule.action,
                 "points": rule.points,
+                "description": rule.description,
                 "observed": observed,
             }
         )
@@ -375,48 +386,75 @@ def decide(signals: List[dict], previous_points: int) -> dict:
            5        → rejected
            2 a 4    → two_factor_required
            0 ou 1   → approved
-      3. aprovado, mas faltou dado (two_factor) → two_factor_required
+      3. aprovado, mas uma regra de 2FA disparou → two_factor_required
 
-    O passo 3 só SOBE a decisão, nunca desce: falta de dado transforma
-    um approved em 2FA, mas nunca livra ninguém de um rejected.
+    O passo 3 só SOBE a decisão, nunca desce: falta de dado e Modo Rua
+    transformam um approved em 2FA, mas nunca livram ninguém de um
+    rejected.
+
+    A decisão sai com o MOTIVO: qual dos três passos decidiu, quais
+    regras causaram a decisão e uma frase que qualquer pessoa lê. É o
+    que fica gravado em todo Pix, inclusive no reprovado.
     """
     points_from_this_pix = 0
-    has_reject = False
-    has_two_factor = False
+    reject_signals = []
+    two_factor_signals = []
+    score_signals = []
 
     for signal in signals:
         if signal["action"] == Rule.SCORE:
             points_from_this_pix = points_from_this_pix + signal["points"]
+            score_signals.append(signal)
         elif signal["action"] == Rule.REJECT:
-            has_reject = True
+            reject_signals.append(signal)
         elif signal["action"] == Rule.TWO_FACTOR:
-            has_two_factor = True
+            two_factor_signals.append(signal)
 
     risk_score = min(MAX_SCORE, previous_points + points_from_this_pix)
+    score_summary = (
+        f"score de risco {risk_score} de {MAX_SCORE}: {previous_points} ponto(s) dos últimos "
+        f"{SCORE_WINDOW_DAYS} dias + {points_from_this_pix} deste Pix"
+    )
 
-    if has_reject:
+    if reject_signals:
         status = AnalysisStatus.REJECTED
-        reason = "blocking_rule"
+        reason = Analysis.BLOCKING_RULE
+        decisive_signals = reject_signals
+        description = "Reprovado por regra de bloqueio: " + _join_descriptions(reject_signals)
     elif risk_score >= REJECT_AT_SCORE:
         status = AnalysisStatus.REJECTED
-        reason = "risk_score"
+        reason = Analysis.RISK_SCORE
+        decisive_signals = score_signals
+        description = f"Reprovado: {score_summary}"
     elif risk_score >= TWO_FACTOR_FROM_SCORE:
         status = AnalysisStatus.TWO_FACTOR_REQUIRED
-        reason = "risk_score"
-    elif has_two_factor:
+        reason = Analysis.RISK_SCORE
+        decisive_signals = score_signals
+        description = f"2FA pedido: {score_summary}"
+    elif two_factor_signals:
         status = AnalysisStatus.TWO_FACTOR_REQUIRED
-        reason = "missing_data"
+        reason = Analysis.TWO_FACTOR_RULE
+        decisive_signals = two_factor_signals
+        description = "2FA pedido: " + _join_descriptions(two_factor_signals)
     else:
         status = AnalysisStatus.APPROVED
-        reason = "risk_score"
+        reason = Analysis.RISK_SCORE
+        decisive_signals = []
+        description = f"Aprovado: {score_summary}"
 
     return {
         "status": status,
         "reason": reason,
+        "decisive_rules": [signal["rule"] for signal in decisive_signals],
+        "description": description,
         "risk_score": risk_score,
         "previous_points": previous_points,
         "points_from_this_pix": points_from_this_pix,
     }
+
+
+def _join_descriptions(signals: List[dict]) -> str:
+    return "; ".join(signal["description"] for signal in signals)
 
 
 def is_night(hour: int) -> bool:
