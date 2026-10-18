@@ -399,7 +399,21 @@ curl -X POST http://localhost:3000/pix/transaction/pix-000123/two-factor \
 docker compose --profile tests run --build --rm tests
 ```
 
-Os testes rodam num container próprio, contra a API de pé — sem Python na máquina. São dois grupos:
+Os testes rodam num container próprio, contra a API de pé — sem Python na máquina.
+
+Também dá para rodar com `pytest` direto na máquina (Linux, Python 3.11), com a API de pé (`docker compose up -d --build`):
+
+```bash
+python3 -m venv .venv && . .venv/bin/activate
+```
+
+```bash
+pip install -r requirements-dev.txt && pytest
+```
+
+Os padrões já apontam para a API em `localhost:3000` e o banco em `localhost:5432`; não precisa de `.env`.
+
+São dois grupos:
 
 - `tests/integration/pix_transaction/`: os cenários pela API — contrato, fatos, cada métrica, Receita, Modo Rua, 2FA, herança e concorrência. Em `test_rule_edges.py`, cada limiar testado na borda (R$ 1.000 contra R$ 1.000,01, 29 contra 30 dias, nota 40 e nota 70), a mediana do ticket e a resposta que não expõe IP, aparelho nem documento.
 - `tests/integration/test_input_robustness.py`: entrada torta de todo tipo. Nenhuma pode virar 500:
