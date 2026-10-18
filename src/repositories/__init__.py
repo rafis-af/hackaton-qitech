@@ -5,3 +5,4 @@ from repositories.rule_result_repository import RuleResultRepository
 from repositories.restricted_party_repository import RestrictedPartyRepository
 from repositories.document_situation_repository import DocumentSituationRepository
 from repositories.two_factor_result_repository import TwoFactorResultRepository
+from repositories.pix_event_repository import PixEventRepository

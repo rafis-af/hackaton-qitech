@@ -30,3 +30,4 @@ class PixTransaction(Base):
     __table_args__ = (UniqueConstraint("pix_id"),)
 
     analysis = relationship("Analysis", back_populates="pix_transaction", uselist=False)
+    events = relationship("PixEvent", back_populates="pix_transaction", order_by="PixEvent.id")

@@ -128,7 +128,13 @@ class TestPixTransactionContract:
 
         status, resent = RequestGenerator.POST_pix_transaction(payload)
         assert status == 200
+
+        original_events = original["metadata"].pop("events")
+        resent_events = resent["metadata"].pop("events")
         assert resent == original
+        assert ObjectGenerator.event_types({"metadata": {"events": resent_events}}) == ObjectGenerator.event_types(
+            {"metadata": {"events": original_events}}
+        ) + ["replay_returned"]
 
     def test_same_id_with_other_data_is_409(self):
         payload = PayloadGenerator.create_pix_payload()

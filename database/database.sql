@@ -11,6 +11,23 @@ INSERT INTO analysis_status (enumerator, description) VALUES
 ('two_factor_required', 'Há dúvida: o banco pede o segundo fator ao cliente'),
 ('rejected', 'O risco é claro: o Pix não sai');
 
+CREATE TABLE pix_event_type(
+    id                              SERIAL PRIMARY KEY,
+    enumerator                      VARCHAR(40) NOT NULL,
+    description                     VARCHAR(255) NOT NULL,
+    created_at                      TIMESTAMPTZ NOT NULL DEFAULT(NOW()),
+    UNIQUE(enumerator)
+);
+
+INSERT INTO pix_event_type (enumerator, description) VALUES
+('receita_unavailable', 'A Receita não respondeu a tempo; o Pix foi analisado sem ela'),
+('analysis_created', 'O Pix chegou e foi analisado'),
+('replay_returned', 'O mesmo Pix chegou de novo e recebeu a análise original'),
+('conflict_refused', 'O mesmo id chegou com outro conteúdo e foi recusado'),
+('two_factor_answered', 'O banco informou o resultado do 2FA dentro do prazo'),
+('two_factor_expired', 'O resultado do 2FA chegou depois do prazo e foi recusado'),
+('two_factor_refused', 'Resposta de 2FA recusada: já respondido, ou o Pix não pediu 2FA');
+
 CREATE TABLE risk_metric(
     id                              SERIAL PRIMARY KEY,
     enumerator                      VARCHAR(30) NOT NULL,
@@ -179,3 +196,16 @@ CREATE TABLE two_factor_result(
 );
 
 CREATE INDEX two_factor_result_pending ON two_factor_result(created_at) WHERE result = 'pending';
+
+CREATE TABLE pix_event(
+    id                              SERIAL PRIMARY KEY,
+    pix_transaction_id              INTEGER NOT NULL REFERENCES pix_transaction(id),
+    event_type_id                   INTEGER NOT NULL REFERENCES pix_event_type(id),
+    request_id                      VARCHAR(64) NOT NULL,
+    error_code                      VARCHAR(10),
+    details                         JSONB NOT NULL,
+    created_at                      TIMESTAMPTZ NOT NULL DEFAULT(NOW()),
+    CHECK(error_code IS NULL OR error_code ~ '^QIT[0-9]{6}$')
+);
+
+CREATE INDEX pix_event_pix ON pix_event(pix_transaction_id, id);

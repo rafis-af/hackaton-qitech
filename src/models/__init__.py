@@ -1,4 +1,5 @@
 from models.analysis_status import AnalysisStatus
+from models.pix_event_type import PixEventType
 from models.risk_metric import RiskMetric
 from models.rule import Rule
 from models.restricted_party import RestrictedParty
@@ -7,3 +8,4 @@ from models.pix_transaction import PixTransaction
 from models.analysis import Analysis
 from models.rule_result import RuleResult
 from models.two_factor_result import TwoFactorResult
+from models.pix_event import PixEvent
