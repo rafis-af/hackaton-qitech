@@ -16,10 +16,12 @@ from errors import (
     TwoFactorExpired,
     TwoFactorNotRequired,
 )
-from models import Analysis, AnalysisStatus, PixTransaction, TwoFactorResult
+from errors.base_error import QIException
+from models import Analysis, AnalysisStatus, PixEventType, PixTransaction, TwoFactorResult
 from repositories import (
     AnalysisRepository,
     DocumentSituationRepository,
+    PixEventRepository,
     PixTransactionRepository,
     RestrictedPartyRepository,
     RuleRepository,
@@ -28,6 +30,7 @@ from repositories import (
 )
 from utils import clock
 from utils.document_number import is_valid_document, only_digits
+from utils.request_context import get_request_id
 
 ARRIVAL_TOLERANCE_MINUTES = 15
 
@@ -46,6 +49,7 @@ class PixTransactionController(BaseController):
         self.restricted_party_repository = RestrictedPartyRepository(self.context)
         self.document_situation_repository = DocumentSituationRepository(self.context)
         self.two_factor_result_repository = TwoFactorResultRepository(self.context)
+        self.pix_event_repository = PixEventRepository(self.context)
 
     def analyze(self, payload: dict) -> dict:
         pix_id = payload["id"]
@@ -118,6 +122,19 @@ class PixTransactionController(BaseController):
                 expires_at=received_at + timedelta(minutes=TWO_FACTOR_EXPIRATION_MINUTES),
             )
 
+        if receita["source"] == "unavailable":
+            self._record_event(pix_transaction, PixEventType.RECEITA_UNAVAILABLE, details={"reason": receita["error"]})
+
+        self._record_event(
+            pix_transaction,
+            PixEventType.ANALYSIS_CREATED,
+            details={
+                "status": decision["status"],
+                "risk_score": decision["risk_score"],
+                "decision_reason": decision["reason"],
+            },
+        )
+
         return self._save(analysis, pix_id, payload_hash)
 
     def get(self, pix_id: str) -> dict:
@@ -135,26 +152,41 @@ class PixTransactionController(BaseController):
         status = analysis.status.enumerator
 
         if status != AnalysisStatus.TWO_FACTOR_REQUIRED:
-            raise TwoFactorNotRequired(pix_id, status)
+            self._refuse(
+                pix_transaction,
+                PixEventType.TWO_FACTOR_REFUSED,
+                TwoFactorNotRequired(pix_id, status),
+                {"reason": "not_required", "result_sent": result},
+            )
 
         two_factor_result = analysis.two_factor_result
         self.two_factor_result_repository.reload(two_factor_result)
         expires_at = clock.to_local_isoformat(two_factor_result.expires_at)
+        expired_details = {"result_sent": result, "expires_at": expires_at}
 
         if two_factor_result.result == TwoFactorResult.EXPIRED:
-            raise TwoFactorExpired(pix_id, expires_at)
+            self._refuse(
+                pix_transaction, PixEventType.TWO_FACTOR_EXPIRED, TwoFactorExpired(pix_id, expires_at), expired_details
+            )
 
         if two_factor_result.result != TwoFactorResult.PENDING:
-            raise TwoFactorAlreadyAnswered(pix_id)
+            self._refuse(
+                pix_transaction,
+                PixEventType.TWO_FACTOR_REFUSED,
+                TwoFactorAlreadyAnswered(pix_id),
+                {"reason": "already_answered", "result_sent": result},
+            )
 
         now = clock.now()
 
         if now > two_factor_result.expires_at:
             self.two_factor_result_repository.resolve(two_factor_result, TwoFactorResult.EXPIRED, now)
-            self.session.commit()
-            raise TwoFactorExpired(pix_id, expires_at)
+            self._refuse(
+                pix_transaction, PixEventType.TWO_FACTOR_EXPIRED, TwoFactorExpired(pix_id, expires_at), expired_details
+            )
 
         self.two_factor_result_repository.resolve(two_factor_result, result, now)
+        self._record_event(pix_transaction, PixEventType.TWO_FACTOR_ANSWERED, details={"result": result})
 
         analysis_dto = AnalysisDTO.obj_to_dict(analysis)
         self.session.commit()
@@ -194,10 +226,32 @@ class PixTransactionController(BaseController):
 
     def _replay_or_refuse(self, existing: PixTransaction, payload_hash: str) -> dict:
         if existing.payload_hash != payload_hash:
-            raise PixTransactionConflict(existing.pix_id)
+            self._refuse(existing, PixEventType.CONFLICT_REFUSED, PixTransactionConflict(existing.pix_id))
 
         self.logger.info(f"Pix {existing.pix_id} repetido: devolvendo a análise original")
-        return {"analysis": AnalysisDTO.obj_to_dict(existing.analysis), "is_replay": True}
+        self._record_event(existing, PixEventType.REPLAY_RETURNED)
+
+        analysis_dto = AnalysisDTO.obj_to_dict(existing.analysis)
+        self.session.commit()
+
+        return {"analysis": analysis_dto, "is_replay": True}
+
+    def _record_event(
+        self, pix_transaction: PixTransaction, event_type: str, error_code: str = None, details: dict = None
+    ) -> None:
+        self.pix_event_repository.create(
+            pix_transaction=pix_transaction,
+            type_enumerator=event_type,
+            request_id=get_request_id(),
+            created_at=clock.now(),
+            error_code=error_code,
+            details=details,
+        )
+
+    def _refuse(self, pix_transaction: PixTransaction, event_type: str, error: QIException, details: dict = None) -> None:
+        self._record_event(pix_transaction, event_type, error.code, details)
+        self.session.commit()
+        raise error
 
     def _save(self, analysis: Analysis, pix_id: str, payload_hash: str) -> dict:
         if not self.pix_transaction_repository.flush_unless_duplicated():

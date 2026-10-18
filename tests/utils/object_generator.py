@@ -42,5 +42,9 @@ class ObjectGenerator:
         return analysis["metadata"]["risk"]
 
     @staticmethod
+    def event_types(analysis: dict) -> list:
+        return [event["type"] for event in analysis["metadata"]["events"]]
+
+    @staticmethod
     def metric_points(analysis: dict) -> dict:
         return {metric["metric"]: metric["points"] for metric in analysis["metadata"]["risk"]["metrics"]}

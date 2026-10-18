@@ -91,8 +91,10 @@ Como o Modo Rua pede 2FA em todo Pix longe dos lugares de costume, um lugar novo
 analysis_status ─┐                    risk_metric ──┐
                  ▼                                  ▼
 pix_transaction ─1:1─► analysis ─1:N─► rule_result ◄─N:1─ rule
-                         │
-                         └─1:0..1─► two_factor_result
+   │                     │
+   │                     └─1:0..1─► two_factor_result
+   │
+   └─1:N─► pix_event ◄─N:1─ pix_event_type
 
 restricted_party      (lista restritiva, consultada por documento)
 document_situation    (cache das respostas da Receita)
@@ -106,11 +108,33 @@ document_situation    (cache das respostas da Receita)
 | `risk_metric` | As 5 métricas e o teto de cada uma | `CHECK (max_points < 40)`: nenhuma métrica decide sozinha |
 | `rule` | Os sinais: pontos, liga/desliga, métrica, ação | Três ações: `score` (comportamento, pertence a uma métrica e vale ponto), `reject` (fato) e `two_factor` (Modo Rua). Fato e Modo Rua não têm métrica e não valem ponto (`CHECK`) |
 | `two_factor_result` | A pendência do 2FA | Nasce `pending` com a análise, com prazo (`expires_at`), e fecha uma vez: `confirmed`, `failed` ou `expired`. Estado numa coluna só, para não existir "pendente e confirmado" ao mesmo tempo |
+| `pix_event` | A linha do tempo de cada Pix: um evento por linha | **Só recebe INSERT.** Liga ao log da aplicação pelo `request_id`. Guarda o código QIT quando o pedido foi recusado (`CHECK` no formato). Não guarda payload, IP, aparelho, documento nem token |
+| `pix_event_type` | Os 7 tipos de evento | Catálogo com chave estrangeira, como `analysis_status` |
 | `analysis_status` | Os 3 status | Catálogo com chave estrangeira, no padrão do Base Service |
 | `restricted_party` | Documentos com fraude confirmada, sanção ou ordem judicial | Local, consultado por índice: a decisão não espera a rede |
 | `document_situation` | O que a Receita respondeu sobre cada documento | Cache de 24 h. Só resposta de verdade entra; falha da Receita não é guardada |
 
 Cinco índices em `pix_transaction` cobrem as consultas do motor: toda métrica começa por "este pagador", "este destino", "este aparelho" ou "este IP", numa janela de tempo.
+
+### A linha do tempo de cada Pix (`pix_event`)
+
+A decisão fica em `analysis`; o que acontece com o Pix depois dela — ou o que não muda a decisão — fica em `pix_event`, um evento por linha:
+
+| Evento | Quando | `details` |
+|---|---|---|
+| `receita_unavailable` | A Receita não respondeu; o Pix seguiu sem ela | o motivo (`timeout`, `http_500`…) |
+| `analysis_created` | O Pix chegou e foi analisado | status, nota e motivo da decisão |
+| `replay_returned` | O mesmo Pix chegou de novo (200) | — |
+| `conflict_refused` | O mesmo id com outro conteúdo (409, `QIT002001`) | — |
+| `two_factor_answered` | O banco informou o 2FA no prazo | `confirmed` ou `failed` |
+| `two_factor_expired` | Resposta de 2FA depois dos 3 minutos (409, `QIT002006`) | o que foi enviado e o prazo |
+| `two_factor_refused` | 2FA já respondido (`QIT002004`) ou Pix que não pediu 2FA (`QIT002003`) | o motivo e o que foi enviado |
+
+**Dois logs, dois lugares.** O log técnico — toda requisição, inclusive 400, 403, 404 e o `/health_check` — continua só na saída da aplicação (`docker compose logs api`). No banco entra só o que aconteceu **com um Pix**: requisição que nem vira Pix é problema técnico, e gravá-la deixaria qualquer um encher a tabela mandando lixo. Os dois se ligam pelo `request_id`, que também volta no cabeçalho `X-Request-ID` da resposta.
+
+**Quem grava é o controller**, porque só ele sabe qual evento aconteceu; o evento de criação entra na mesma transação da análise. Uma recusa (409) grava o evento e dá `commit` antes de devolver o erro — senão o rastro da recusa se perderia com o `rollback`. Ler (`GET`) nunca grava evento.
+
+**Para que serve:** auditoria (a história de um Pix numa consulta só), antifraude (um 409 de conflito é alguém tentando trocar um Pix já decidido) e calibração (os 2FA confirmados e falhados ficam registrados com hora).
 
 **Retenção (LGPD):** aqui o histórico fica para sempre, por ser um projeto de estudo. Em produção, o que passa de 90 dias sairia do banco — é a maior janela que o motor usa, e guardar IP, aparelho e localização além disso não serve a regra nenhuma.
 
@@ -275,7 +299,8 @@ O JSON do desafio, com um pagador sem histórico: R$ 1.500 às 22:15, para uma c
     "signals": [ { "rule": "night_without_history", "points": 20, "observed": { "local_time": "22:15" } }, "..." ],
     "receita": { "source": "api", "situation": "regular" },
     "arrival": { "received_at": "...", "far_from_arrival": false },
-    "two_factor": { "result": "pending", "expires_at": "...", "resolved_at": null }
+    "two_factor": { "result": "pending", "expires_at": "...", "resolved_at": null },
+    "events": [ { "type": "analysis_created", "error_code": null, "details": { "status": "two_factor_required", "risk_score": 50, "decision_reason": "risk_score" }, "request_id": "...", "created_at": "..." } ]
   }
 }
 ```
@@ -285,6 +310,7 @@ O JSON do desafio, com um pagador sem histórico: R$ 1.500 às 22:15, para uma c
 - `signals`: o que cada sinal viu.
 - `receita`: de onde veio a situação de quem recebe (`api`, `cache`, `unavailable`, `skipped`, `disabled`).
 - `arrival`: todas as janelas contam a partir da data do Pix (`transaction_date`). Se ela estiver a mais de 15 minutos da hora de chegada, fica marcado aqui — não muda a decisão, só deixa visível.
+- `events`: a linha do tempo do Pix, em ordem (ver [A linha do tempo de cada Pix](#a-linha-do-tempo-de-cada-pix-pix_event)).
 
 ### Falta de dado nunca reprova
 
@@ -415,7 +441,7 @@ Os padrões já apontam para a API em `localhost:3000` e o banco em `localhost:5
 
 São dois grupos:
 
-- `tests/integration/pix_transaction/`: os cenários pela API — contrato, fatos, cada métrica, Receita, Modo Rua, 2FA, herança e concorrência. Em `test_rule_edges.py`, cada limiar testado na borda (R$ 1.000 contra R$ 1.000,01, 29 contra 30 dias, nota 40 e nota 70), a mediana do ticket e a resposta que não expõe IP, aparelho nem documento.
+- `tests/integration/pix_transaction/`: os cenários pela API — contrato, fatos, cada métrica, Receita, Modo Rua, 2FA, herança e concorrência. Em `test_rule_edges.py`, cada limiar testado na borda (R$ 1.000 contra R$ 1.000,01, 29 contra 30 dias, nota 40 e nota 70), a mediana do ticket e a resposta que não expõe IP, aparelho nem documento. Em `test_pix_events.py`, a linha do tempo: cada evento, o `request_id` e a garantia de que ler não grava nada.
 - `tests/integration/test_input_robustness.py`: entrada torta de todo tipo. Nenhuma pode virar 500:
   - **corpo:** o que não é JSON, JSON em UTF-16 ou com BOM, bytes que não são UTF-8, megabytes de espaço, 100 mil campos extras, corpo em chunks;
   - **campos:** tipos errados, números com 5.000 dígitos, NaN e infinito, inteiro escrito como `5000.0`, surrogate solto, caracteres de controle;

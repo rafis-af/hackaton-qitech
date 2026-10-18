@@ -21,6 +21,17 @@ class AnalysisDTO:
                 "resolved_at": resolved_at,
             }
 
+        metadata["events"] = [
+            {
+                "type": event.event_type.enumerator,
+                "error_code": event.error_code,
+                "details": deepcopy(event.details),
+                "request_id": event.request_id,
+                "created_at": to_local_isoformat(event.created_at),
+            }
+            for event in analysis.pix_transaction.events
+        ]
+
         return {
             "key": analysis.analysis_key,
             "status": analysis.status.enumerator,
