@@ -2,11 +2,14 @@ from datetime import datetime
 from typing import List, Optional, Tuple
 
 from sqlalchemy import and_, func, or_, text
+from sqlalchemy.exc import IntegrityError
 
 from database import Context
 from models import Analysis, AnalysisStatus, PixTransaction, TwoFactorResult
 
 SAO_PAULO_TIMEZONE = "America/Sao_Paulo"
+
+PIX_ID_UNIQUE = "pix_transaction_pix_id_key"
 
 
 class PixTransactionRepository:
@@ -22,6 +25,19 @@ class PixTransactionRepository:
         self.session.add(pix_transaction)
         return pix_transaction
 
+    def flush_unless_duplicated(self) -> bool:
+        try:
+            self.session.flush()
+        except IntegrityError as error:
+            self.session.rollback()
+
+            if getattr(error.orig.diag, "constraint_name", None) != PIX_ID_UNIQUE:
+                raise
+
+            return False
+
+        return True
+
     def get_by_pix_id(self, pix_id: str) -> Optional[PixTransaction]:
         return self.session.query(PixTransaction).filter(PixTransaction.pix_id == pix_id).first()
 
@@ -35,11 +51,15 @@ class PixTransactionRepository:
         history_start: datetime,
         short_window_start: datetime,
         burst_window_start: datetime,
+        day_window_start: datetime,
         destination: dict,
         device_id: str,
         hour_band: List[int],
+        night_hours: List[int],
+        night_limit: int,
+        trust: dict,
     ) -> dict:
-        trusted = self._trusted()
+        trusted = self._trusted(trust)
         same_destination = and_(
             PixTransaction.dest_participant == destination["participant"],
             PixTransaction.dest_branch == destination["branch"],
@@ -47,6 +67,8 @@ class PixTransactionRepository:
         )
         local_hour = func.extract("hour", func.timezone(SAO_PAULO_TIMEZONE, PixTransaction.transaction_date))
         in_short_window = PixTransaction.transaction_date > short_window_start
+        in_day_window = and_(trusted, PixTransaction.transaction_date > day_window_start)
+        night_above_limit = and_(trusted, local_hour.in_(night_hours), PixTransaction.amount > night_limit)
 
         row = (
             self.session.query(
@@ -60,6 +82,9 @@ class PixTransactionRepository:
                 func.coalesce(
                     func.bool_or(and_(in_short_window, PixTransaction.device_id != device_id)), False
                 ).label("other_device_in_short_window"),
+                func.coalesce(func.sum(PixTransaction.amount).filter(in_day_window), 0).label("day_sum"),
+                func.count(PixTransaction.id).filter(in_day_window).label("day_count"),
+                func.coalesce(func.bool_or(night_above_limit), False).label("trusted_night_above_limit"),
             )
             .select_from(PixTransaction)
             .join(Analysis, Analysis.pix_transaction_id == PixTransaction.id)
@@ -84,9 +109,44 @@ class PixTransactionRepository:
             "known_destination": row.known_destination,
             "burst_count": row.burst_count,
             "other_device_in_short_window": row.other_device_in_short_window,
+            "day_sum": int(row.day_sum),
+            "day_count": row.day_count,
+            "trusted_night_above_limit": row.trusted_night_above_limit,
         }
 
-    def known_places(self, document: str, history_start: datetime, transaction_date: datetime) -> List[Tuple[float, float]]:
+    def daily_totals(self, document: str, history_start: datetime, window_start: datetime, trust: dict) -> dict:
+        local_day = func.date(func.timezone(SAO_PAULO_TIMEZONE, PixTransaction.transaction_date))
+
+        per_day = (
+            self.session.query(func.sum(PixTransaction.amount).label("total"))
+            .select_from(PixTransaction)
+            .join(Analysis, Analysis.pix_transaction_id == PixTransaction.id)
+            .join(AnalysisStatus, AnalysisStatus.id == Analysis.status_id)
+            .outerjoin(TwoFactorResult, TwoFactorResult.analysis_id == Analysis.id)
+            .filter(
+                PixTransaction.source_document == document,
+                PixTransaction.transaction_date > history_start,
+                PixTransaction.transaction_date <= window_start,
+                self._trusted(trust),
+            )
+            .group_by(local_day)
+            .subquery()
+        )
+
+        row = self.session.query(
+            func.count().label("active_days"),
+            func.avg(per_day.c.total).label("average"),
+        ).one()
+
+        average = None
+        if row.average is not None:
+            average = int(row.average)
+
+        return {"active_days": row.active_days, "average": average}
+
+    def known_places(
+        self, document: str, history_start: datetime, transaction_date: datetime, trust: dict
+    ) -> List[Tuple[float, float]]:
         rounded_latitude = func.round(PixTransaction.latitude, 2)
         rounded_longitude = func.round(PixTransaction.longitude, 2)
 
@@ -101,7 +161,7 @@ class PixTransactionRepository:
                 PixTransaction.transaction_date > history_start,
                 PixTransaction.transaction_date <= transaction_date,
                 PixTransaction.latitude.isnot(None),
-                self._trusted(),
+                self._trusted(trust),
             )
             .distinct()
             .all()
@@ -173,8 +233,8 @@ class PixTransactionRepository:
             .scalar()
         )
 
-    def _trusted(self):
+    def _trusted(self, trust: dict):
         return or_(
-            AnalysisStatus.enumerator == AnalysisStatus.APPROVED,
-            TwoFactorResult.result == TwoFactorResult.CONFIRMED,
+            AnalysisStatus.enumerator.in_(trust["statuses"]),
+            TwoFactorResult.result.in_(trust["two_factor_results"]),
         )

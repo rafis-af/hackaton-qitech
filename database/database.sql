@@ -24,7 +24,7 @@ CREATE TABLE risk_metric(
 
 INSERT INTO risk_metric (enumerator, label, description, max_points) VALUES
 ('hour',        'horário',     'O Pix saiu num horário em que o cliente não costuma pagar', 35),
-('amount',      'valor',       'O valor está acima do ticket médio do cliente', 30),
+('amount',      'valor',       'O valor deste Pix, ou a soma do dia, passou do normal do cliente ou do teto', 30),
 ('location',    'local',       'O Pix saiu longe de todos os lugares de costume do cliente (Modo Rua)', 25),
 ('velocity',    'velocidade',  'Muitos Pix do cliente em poucos minutos', 20),
 ('destination', 'destino',     'Quem recebe é novo para o cliente, ou dá sinais de conta laranja', 15),
@@ -51,6 +51,7 @@ CREATE TABLE rule(
 INSERT INTO rule (enumerator, risk_metric_id, action, points, description) VALUES
 
 ('invalid_document_number',       NULL, 'reject', 0, 'CPF/CNPJ de quem paga ou de quem recebe com dígito verificador errado'),
+('account_opened_after_pix',      NULL, 'reject', 0, 'A conta de quem paga ou de quem recebe foi aberta depois do Pix'),
 ('restricted_payer',              NULL, 'reject', 0, 'Quem paga está na lista restritiva'),
 ('restricted_destination',        NULL, 'reject', 0, 'Quem recebe está na lista restritiva'),
 ('receita_destination_blocked',   NULL, 'reject', 0, 'Na Receita, o CPF/CNPJ de quem recebe não existe, foi cancelado, é nulo ou é de titular falecido'),
@@ -63,6 +64,9 @@ INSERT INTO rule (enumerator, risk_metric_id, action, points, description) VALUE
 ('amount_3x_profile',             (SELECT id FROM risk_metric WHERE enumerator = 'amount'), 'score', 20, 'Valor entre 3x e 5x o ticket médio do cliente'),
 ('amount_2x_profile',             (SELECT id FROM risk_metric WHERE enumerator = 'amount'), 'score', 10, 'Valor entre 2x e 3x o ticket médio do cliente'),
 ('high_amount_without_history',   (SELECT id FROM risk_metric WHERE enumerator = 'amount'), 'score', 15, 'Pix acima de R$ 1.000 de um cliente ainda sem ticket médio'),
+('night_limit_exceeded',          (SELECT id FROM risk_metric WHERE enumerator = 'amount'), 'score', 20, 'Limite: Pix noturno de pessoa física acima de R$ 1.000, e o cliente nunca passou desse teto à noite'),
+('day_sum_3x_profile',            (SELECT id FROM risk_metric WHERE enumerator = 'amount'), 'score', 20, 'Montante: a soma das últimas 24 horas passou de 3x o total diário médio do cliente'),
+('day_sum_without_history',       (SELECT id FROM risk_metric WHERE enumerator = 'amount'), 'score', 15, 'Montante: a soma das últimas 24 horas passou de R$ 1.000, e o cliente ainda não tem total diário médio'),
 
 ('far_from_usual_places',         (SELECT id FROM risk_metric WHERE enumerator = 'location'), 'score', 25, 'Modo Rua: Pix a mais de 30 km de todos os lugares de costume do cliente'),
 

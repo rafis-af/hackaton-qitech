@@ -23,6 +23,14 @@ AMOUNT_RATIO_MEDIUM = 3
 AMOUNT_RATIO_LOW = 2
 HIGH_AMOUNT_WITHOUT_HISTORY = 100000
 
+CPF_LENGTH = 11
+NIGHT_LIMIT = 100000
+
+DAY_SUM_WINDOW_HOURS = 24
+MIN_DAILY_HISTORY = 3
+DAY_SUM_RATIO = 3
+DAY_SUM_FLOOR = 100000
+
 STREET_MODE_RADIUS_KM = 30
 EARTH_RADIUS_KM = 6371
 
@@ -49,6 +57,9 @@ DEVICE_CHANGE_WINDOW_HOURS = 24
 DEVICE_SHARED_WINDOW_DAYS = 30
 IP_SHARED_WINDOW_HOURS = 24
 
+TRUSTED_STATUSES = [AnalysisStatus.APPROVED]
+TRUSTED_TWO_FACTOR_RESULTS = [TwoFactorResult.CONFIRMED]
+
 MEMORY_HOURS = 24
 CARRY_WHEN_CONFIRMED = 0.0
 CARRY_WHEN_FAILED = 1.0
@@ -68,6 +79,21 @@ def check_invalid_document_number(facts: dict) -> Optional[dict]:
         return None
 
     return {"invalid_fields": invalid_fields}
+
+
+def check_account_opened_after_pix(facts: dict) -> Optional[dict]:
+    opened_after = []
+
+    if facts["payer"]["opening_date"] > facts["transaction_date"]:
+        opened_after.append("source_account.opening_date")
+
+    if facts["destination"]["opening_date"] > facts["transaction_date"]:
+        opened_after.append("destination_account.opening_date")
+
+    if not opened_after:
+        return None
+
+    return {"opened_after_pix": opened_after}
 
 
 def check_restricted_payer(facts: dict) -> Optional[dict]:
@@ -148,6 +174,51 @@ def check_high_amount_without_history(facts: dict) -> Optional[dict]:
         return None
 
     return {"amount": facts["amount"], "threshold": HIGH_AMOUNT_WITHOUT_HISTORY}
+
+
+def check_night_limit_exceeded(facts: dict) -> Optional[dict]:
+    history = facts["history"]
+
+    if history["trusted_count"] < MIN_TICKET_HISTORY or history["trusted_night_above_limit"]:
+        return None
+
+    if len(facts["payer"]["document"]) != CPF_LENGTH:
+        return None
+
+    if not is_night(facts["transaction_date"].hour) or facts["amount"] <= NIGHT_LIMIT:
+        return None
+
+    return {
+        "amount": facts["amount"],
+        "night_limit": NIGHT_LIMIT,
+        "local_time": facts["transaction_date"].strftime("%H:%M"),
+    }
+
+
+def check_day_sum_3x_profile(facts: dict) -> Optional[dict]:
+    daily_totals = facts["daily_totals"]
+
+    if daily_totals["active_days"] < MIN_DAILY_HISTORY or not daily_totals["average"]:
+        return None
+
+    observed = _day_sum_observed(facts)
+
+    if observed is None:
+        return None
+
+    ratio = observed["day_sum"] / daily_totals["average"]
+
+    if ratio < DAY_SUM_RATIO:
+        return None
+
+    return {**observed, "average_daily_total": daily_totals["average"], "ratio": round(ratio, 1)}
+
+
+def check_day_sum_without_history(facts: dict) -> Optional[dict]:
+    if facts["daily_totals"]["active_days"] >= MIN_DAILY_HISTORY:
+        return None
+
+    return _day_sum_observed(facts)
 
 
 def check_far_from_usual_places(facts: dict) -> Optional[dict]:
@@ -253,6 +324,7 @@ def check_ip_shared(facts: dict) -> Optional[dict]:
 
 RULE_CHECKS: Dict[str, Callable[[dict], Optional[dict]]] = {
     "invalid_document_number": check_invalid_document_number,
+    "account_opened_after_pix": check_account_opened_after_pix,
     "restricted_payer": check_restricted_payer,
     "restricted_destination": check_restricted_destination,
     "receita_destination_blocked": check_receita_destination_blocked,
@@ -263,6 +335,9 @@ RULE_CHECKS: Dict[str, Callable[[dict], Optional[dict]]] = {
     "amount_3x_profile": check_amount_3x_profile,
     "amount_2x_profile": check_amount_2x_profile,
     "high_amount_without_history": check_high_amount_without_history,
+    "night_limit_exceeded": check_night_limit_exceeded,
+    "day_sum_3x_profile": check_day_sum_3x_profile,
+    "day_sum_without_history": check_day_sum_without_history,
     "far_from_usual_places": check_far_from_usual_places,
     "burst_4_in_10_minutes": check_burst_4_in_10_minutes,
     "burst_3_in_10_minutes": check_burst_3_in_10_minutes,
@@ -399,6 +474,10 @@ def is_night(hour: int) -> bool:
     return hour >= NIGHT_START_HOUR or hour < NIGHT_END_HOUR
 
 
+def night_hours() -> List[int]:
+    return [hour for hour in range(24) if is_night(hour)]
+
+
 def hour_band(hour: int) -> List[int]:
     return sorted({(hour + offset) % 24 for offset in range(-HOUR_BAND_WIDTH, HOUR_BAND_WIDTH + 1)})
 
@@ -412,7 +491,7 @@ def distance_km(origin: tuple, destination: tuple) -> float:
         + math.cos(latitude_1) * math.cos(latitude_2) * math.sin((longitude_2 - longitude_1) / 2) ** 2
     )
 
-    return 2 * EARTH_RADIUS_KM * math.asin(math.sqrt(half_chord))
+    return 2 * EARTH_RADIUS_KM * math.asin(math.sqrt(min(half_chord, 1.0)))
 
 
 def _hour_share(history: dict) -> float:
@@ -447,6 +526,20 @@ def _amount_ratio_between(facts: dict, low: float, high: Optional[float]) -> Opt
         return None
 
     return {"amount": facts["amount"], "average_ticket": history["average_ticket"], "ratio": round(ratio, 1)}
+
+
+def _day_sum_observed(facts: dict) -> Optional[dict]:
+    history = facts["history"]
+
+    if history["day_count"] == 0:
+        return None
+
+    day_sum = history["day_sum"] + facts["amount"]
+
+    if day_sum <= DAY_SUM_FLOOR:
+        return None
+
+    return {"day_sum": day_sum, "pix_in_window": history["day_count"] + 1, "window_hours": DAY_SUM_WINDOW_HOURS}
 
 
 def _burst_count(facts: dict) -> int:

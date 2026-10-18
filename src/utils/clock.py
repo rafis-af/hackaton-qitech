@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from errors import InvalidDateTime
@@ -8,6 +8,9 @@ SAO_PAULO = ZoneInfo("America/Sao_Paulo")
 PIX_LAUNCH = datetime(2020, 11, 16, tzinfo=SAO_PAULO)
 EARLIEST_ACCOUNT = datetime(1900, 1, 1, tzinfo=SAO_PAULO)
 LATEST_DATE = datetime(2100, 12, 31, 23, 59, 59, tzinfo=SAO_PAULO)
+
+EARLIEST_OFFSET = timedelta(hours=-12)
+LATEST_OFFSET = timedelta(hours=14)
 
 
 def now() -> datetime:
@@ -23,6 +26,9 @@ def parse_datetime(field: str, raw_datetime: str, earliest: datetime, latest: da
         moment = datetime.fromisoformat(raw_datetime.replace("Z", "+00:00"))
         moment.astimezone(timezone.utc)
     except (ValueError, OverflowError):
+        raise InvalidDateTime(field, raw_datetime)
+
+    if not EARLIEST_OFFSET <= moment.utcoffset() <= LATEST_OFFSET:
         raise InvalidDateTime(field, raw_datetime)
 
     if not earliest <= moment <= latest:

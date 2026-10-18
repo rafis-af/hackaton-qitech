@@ -19,6 +19,9 @@ class TwoFactorResultRepository:
         self.session.add(two_factor_result)
         return two_factor_result
 
+    def reload(self, two_factor_result: TwoFactorResult) -> None:
+        self.session.refresh(two_factor_result)
+
     def resolve(self, two_factor_result: TwoFactorResult, result: str, resolved_at: datetime) -> None:
         two_factor_result.result = result
         two_factor_result.resolved_at = resolved_at

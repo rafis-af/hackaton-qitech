@@ -54,4 +54,4 @@ class TestConcurrency:
         results = run_at_the_same_time(payloads)
 
         statuses = sorted(response["status"] for _status, response in results)
-        assert statuses == ["approved"] * 2 + ["two_factor_required"] * 4
+        assert statuses == ["approved"] + ["rejected"] * 4 + ["two_factor_required"]

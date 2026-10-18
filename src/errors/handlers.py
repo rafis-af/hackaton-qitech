@@ -16,15 +16,26 @@ from utils.logger import get_logger
 
 logger = get_logger(__name__)
 
+MAX_DESCRIPTION_LENGTH = 500
+
 
 def qi_exception_to_response(exception: QIException) -> JSONResponse:
     body = {
         "title": exception.title,
-        "description": exception.description,
+        "description": safe_description(exception.description),
         "translation": exception.translation,
         "code": exception.code,
     }
     return JSONResponse(status_code=exception.http_status, content=body)
+
+
+def safe_description(description) -> str:
+    text = str(description)
+
+    if len(text) > MAX_DESCRIPTION_LENGTH:
+        text = text[:MAX_DESCRIPTION_LENGTH] + "..."
+
+    return text.encode("utf-8", "replace").decode("utf-8")
 
 
 def describe_validation_error(error: dict) -> str:

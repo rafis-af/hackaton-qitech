@@ -3,9 +3,9 @@
   "type": "object",
   "properties": {
     "id": {
-      "description": "Volta no endereço do GET (/pix/transaction/{id}): só o que cabe num endereço sem codificação.",
+      "description": "Volta no endereço do GET (/pix/transaction/{id}): só o que cabe num endereço sem codificação. '.' e '..' não, porque os clientes HTTP os resolvem como pasta.",
       "type": "string",
-      "pattern": "^[A-Za-z0-9._:-]{1,100}$"
+      "pattern": "^(?!\\.\\.?$)[A-Za-z0-9._:-]{1,100}$"
     },
     "amount": {
       "description": "Centavos. O máximo é o maior número que cabe na coluna BIGINT: acima dele, o banco recusaria a gravação.",

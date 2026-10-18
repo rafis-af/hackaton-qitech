@@ -223,6 +223,33 @@ class TestAmountAndDestination:
         assert "destination_many_payers" in ObjectGenerator.fired_rules(analyses[4])
 
 
+class TestLimitAndDaySum:
+    def test_night_pix_above_the_limit_weighs_even_inside_the_ticket(self):
+        payer = RandomGenerator.generate_cpf()
+        rent = PayloadGenerator.create_destination()
+        build_history(payer, rent, days=5, amount=80000)
+
+        at_night = ObjectGenerator.send_pix(payer_document=payer, destination=rent, amount=150000, transaction_date=NIGHTTIME)
+
+        assert "night_limit_exceeded" in ObjectGenerator.fired_rules(at_night)
+        assert "amount_2x_profile" not in ObjectGenerator.fired_rules(at_night)
+        assert ObjectGenerator.metric_points(at_night)["amount"] == 20
+
+    def test_split_pix_adds_up(self):
+        payer = RandomGenerator.generate_cpf()
+        destination = PayloadGenerator.create_destination()
+
+        first = ObjectGenerator.send_pix(payer_document=payer, destination=destination, amount=60000)
+        second = ObjectGenerator.send_pix(
+            payer_document=payer, destination=destination, amount=60000, transaction_date=DAYTIME + timedelta(hours=1)
+        )
+
+        assert "day_sum_without_history" not in ObjectGenerator.fired_rules(first)
+        assert "day_sum_without_history" in ObjectGenerator.fired_rules(second)
+        assert "high_amount_without_history" not in ObjectGenerator.fired_rules(second)
+        assert ObjectGenerator.metric_points(second)["amount"] == 15
+
+
 class TestVelocity:
     def test_burst_of_small_pix(self):
         payer = RandomGenerator.generate_cpf()

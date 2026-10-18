@@ -4,8 +4,6 @@ import re
 from datetime import datetime, timedelta
 from typing import Optional
 
-from sqlalchemy.exc import IntegrityError
-
 from connectors import ReceitaConnector, ReceitaUnavailable
 from constants import RECEITA_CACHE_HOURS, RECEITA_ENABLED
 from controllers import risk_rules
@@ -140,7 +138,7 @@ class PixTransactionController(BaseController):
             raise TwoFactorNotRequired(pix_id, status)
 
         two_factor_result = analysis.two_factor_result
-        self.session.refresh(two_factor_result)
+        self.two_factor_result_repository.reload(two_factor_result)
         expires_at = clock.to_local_isoformat(two_factor_result.expires_at)
 
         if two_factor_result.result == TwoFactorResult.EXPIRED:
@@ -157,7 +155,6 @@ class PixTransactionController(BaseController):
             raise TwoFactorExpired(pix_id, expires_at)
 
         self.two_factor_result_repository.resolve(two_factor_result, result, now)
-        self.session.flush()
 
         analysis_dto = AnalysisDTO.obj_to_dict(analysis)
         self.session.commit()
@@ -203,15 +200,8 @@ class PixTransactionController(BaseController):
         return {"analysis": AnalysisDTO.obj_to_dict(existing.analysis), "is_replay": True}
 
     def _save(self, analysis: Analysis, pix_id: str, payload_hash: str) -> dict:
-        try:
-            self.session.flush()
-        except IntegrityError:
-            self.session.rollback()
-
+        if not self.pix_transaction_repository.flush_unless_duplicated():
             existing = self.pix_transaction_repository.get_by_pix_id(pix_id)
-            if existing is None:
-                raise
-
             return self._replay_or_refuse(existing, payload_hash)
 
         analysis_dto = AnalysisDTO.obj_to_dict(analysis)
@@ -294,6 +284,8 @@ class PixTransactionController(BaseController):
         }
 
         history_start = transaction_date - timedelta(days=risk_rules.HISTORY_DAYS)
+        day_window_start = transaction_date - timedelta(hours=risk_rules.DAY_SUM_WINDOW_HOURS)
+        trust = {"statuses": risk_rules.TRUSTED_STATUSES, "two_factor_results": risk_rules.TRUSTED_TWO_FACTOR_RESULTS}
 
         history = self.pix_transaction_repository.payer_history(
             document=document,
@@ -301,9 +293,13 @@ class PixTransactionController(BaseController):
             history_start=history_start,
             short_window_start=transaction_date - timedelta(hours=risk_rules.DEVICE_CHANGE_WINDOW_HOURS),
             burst_window_start=transaction_date - timedelta(minutes=risk_rules.BURST_WINDOW_MINUTES),
+            day_window_start=day_window_start,
             destination=destination,
             device_id=pix_data["device_id"],
             hour_band=risk_rules.hour_band(local_transaction_date.hour),
+            night_hours=risk_rules.night_hours(),
+            night_limit=risk_rules.NIGHT_LIMIT,
+            trust=trust,
         )
 
         location = None
@@ -315,10 +311,11 @@ class PixTransactionController(BaseController):
             "transaction_date": local_transaction_date,
             "device_id": pix_data["device_id"],
             "location": location,
-            "known_places": self.pix_transaction_repository.known_places(document, history_start, transaction_date),
+            "known_places": self.pix_transaction_repository.known_places(document, history_start, transaction_date, trust),
             "payer": {
                 "document": document,
                 "document_is_valid": is_valid_document(document),
+                "opening_date": pix_data["source_opening_date"],
                 "restricted_reason": self._restricted_reason(document),
             },
             "destination": {
@@ -329,6 +326,7 @@ class PixTransactionController(BaseController):
                 "receita_situation": receita["situation"],
             },
             "history": history,
+            "daily_totals": self.pix_transaction_repository.daily_totals(document, history_start, day_window_start, trust),
             "destination_payers": self.pix_transaction_repository.count_destination_payers(
                 destination,
                 transaction_date - timedelta(hours=risk_rules.DESTINATION_PAYERS_WINDOW_HOURS),

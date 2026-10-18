@@ -3,7 +3,8 @@ import json
 import math
 import os
 
-from jsonschema import RefResolver, ValidationError, validate
+from jsonschema import RefResolver, ValidationError, validate, validators
+from jsonschema.exceptions import best_match
 
 from constants import SCHEMA_PATH
 from errors import InvalidSchema
@@ -11,6 +12,7 @@ from errors import InvalidSchema
 
 class SchemaCache:
     schemas = {}
+    strict_validators = {}
 
     @staticmethod
     def get_schema(schema_file_name: str) -> dict:
@@ -50,9 +52,8 @@ class SchemaHandler:
 
                 refuse_what_json_schema_cannot_see(kwargs["payload"])
 
-                try:
-                    validate(kwargs["payload"], schema, resolver=resolver)
-                except ValidationError as error:
+                error = best_match(strict_validator(schema)(schema, resolver=resolver).iter_errors(kwargs["payload"]))
+                if error is not None:
                     raise InvalidSchema(describe_schema_error(error))
 
                 return func(*args, **kwargs)
@@ -89,6 +90,20 @@ class SchemaHandler:
         return decorator_validate
 
 
+def is_strict_integer(checker, instance) -> bool:
+    return isinstance(instance, int) and not isinstance(instance, bool)
+
+
+def strict_validator(schema: dict):
+    base = validators.validator_for(schema)
+
+    if base not in SchemaCache.strict_validators:
+        type_checker = base.TYPE_CHECKER.redefine("integer", is_strict_integer)
+        SchemaCache.strict_validators[base] = validators.extend(base, type_checker=type_checker)
+
+    return SchemaCache.strict_validators[base]
+
+
 def query_params_to_dict(query_params, schema: dict) -> dict:
     properties = schema.get("properties", {})
     parsed_params = {}
@@ -111,13 +126,26 @@ def refuse_what_json_schema_cannot_see(value, location: list = None) -> None:
         current, path = pending.pop()
 
         if isinstance(current, dict):
+            for key in current:
+                if has_unsafe_character(key):
+                    raise InvalidSchema(f"field names with control characters or invalid unicode are not allowed in {'.'.join(path) or 'body'}")
             pending.extend((item, path + [str(key)]) for key, item in current.items())
         elif isinstance(current, list):
             pending.extend((item, path + [str(index)]) for index, item in enumerate(current))
         elif isinstance(current, float) and not math.isfinite(current):
             raise InvalidSchema(f"{current} is not a valid JSON number in {'.'.join(path)}")
-        elif isinstance(current, str) and any(ord(character) < 32 or ord(character) == 127 for character in current):
-            raise InvalidSchema(f"control characters are not allowed in {'.'.join(path)}")
+        elif isinstance(current, str) and has_unsafe_character(current):
+            raise InvalidSchema(f"control characters or invalid unicode are not allowed in {'.'.join(path)}")
+
+
+def has_unsafe_character(text: str) -> bool:
+    for character in text:
+        code = ord(character)
+
+        if code < 32 or code == 127 or 0xD800 <= code <= 0xDFFF:
+            return True
+
+    return False
 
 
 def describe_schema_error(error: ValidationError) -> str:

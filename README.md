@@ -7,6 +7,25 @@ Ela não move dinheiro: quem envia ou cancela o Pix é o banco. O antifraude dec
 
 ---
 
+## Comece aqui
+
+```bash
+docker compose up -d --build
+```
+
+Com a API no ar em `http://localhost:3000`, use:
+
+- `POST /pix/transaction` para analisar e registrar um Pix;
+- `GET /pix/transaction/{id}` para consultar a análise gravada;
+- `POST /pix/transaction/{id}/two-factor` para informar o resultado do segundo fator;
+- `docker compose --profile tests run --build --rm tests` para executar a suíte.
+
+O exemplo completo de requisição, os códigos HTTP e a configuração estão em [Como rodar e testar](#como-rodar-e-testar).
+
+**Navegação:** [Decisão](#como-o-motor-de-decisão-funciona) · [Regras](#regras) · [2FA e risco](#como-as-regras-viram-decisão) · [Execução e contrato](#como-rodar-e-testar)
+
+---
+
 ## Como o motor de decisão funciona
 
 ### A tese
@@ -39,9 +58,20 @@ POST /pix/transaction
   └─ 9. grava tudo                  o Pix, a decisão, cada sinal — inclusive quando reprova
 ```
 
-O motor (`src/controllers/risk_rules.py`) é feito de **funções puras**: o controller busca os números no banco, e cada sinal só compara. Por isso cada regra é testada sem banco, e a mesma entrada dá sempre a mesma decisão.
+O motor (`src/controllers/risk_rules.py`) é feito de **funções puras**: o controller busca os números no banco, e cada sinal só compara. Por isso a mesma entrada dá sempre a mesma decisão.
 
 Os **pontos de cada sinal** e o **teto de cada métrica** moram no banco (tabelas `rule` e `risk_metric`): mudam com um `UPDATE`, sem deploy. Os **limiares** (3x o ticket, 30 km, 10 minutos) moram no código, ao lado da conta que os usa.
+
+As camadas seguem o Base Service: o **resource** só valida o corpo (schema), chama o controller e escolhe o status HTTP; o **controller** decide e é o único que dá `commit`, sempre depois de todas as checagens; o **repository** é a única porta do banco e não decide nada — até a definição de "Pix confiável" vem do motor como parâmetro; o **DTO** escolhe o que sai na resposta, e o model nunca sai direto.
+
+### O escopo: o que fica de fora e o que vai além
+
+O desafio pede o `POST` e o `GET` de `/pix/transaction`, e deixa de fora outras APIs. Duas peças vão além disso, de propósito:
+
+- **`POST /pix/transaction/{id}/two-factor`.** Pedir 2FA só faz sentido se o resultado volta. Sem esta rota, o motor não distingue quem confirmou a selfie de quem falhou, e o risco herdado não teria como punir o ladrão que insiste (ver [O risco herdado](#o-risco-herdado)). Ela não decide nada novo: só fecha a pendência que o próprio `POST` abriu.
+- **A consulta à Receita.** Não é uma API que construímos para o produto: é um **mock** de um serviço externo, para mostrar como o motor consulta uma base de fora sem depender dela. A consulta tem prazo de 0,5 s, cache de 24 h e nunca reprova por falha — a resposta ao "não dá para esperar uma consulta externa pesada". Com `RECEITA_ENABLED=false`, o motor roda sem ela.
+
+Cadastro de contas e front-end ficam de fora: a conta chega pronta no payload.
 
 ### O que é "normal" para o cliente
 
@@ -87,13 +117,25 @@ Cinco índices em `pix_transaction` cobrem as consultas do motor: toda métrica 
 | Métrica | Teto | O que pergunta |
 |---|---|---|
 | Horário | 35 | O cliente costuma pagar nesta hora? |
-| Valor | 30 | O valor cabe no ticket médio dele? |
+| Valor | 30 | O valor cabe no ticket médio dele? Passou do teto? E a soma do dia? |
 | Local (Modo Rua) | 25 | Saiu de perto dos lugares de costume? |
 | Velocidade | 20 | Quantos Pix ele fez nos últimos minutos? |
 | Destino | 15 | Ele já pagou esta conta? Ela parece laranja? |
 | Origem | 10 | O aparelho e o IP batem com a conta? |
 
 Os sinais de uma mesma métrica somam, mas nunca passam do teto dela.
+
+### As cinco famílias do desafio
+
+| Família | Pergunta | Regras |
+|---|---|---|
+| Limite | Passou do teto? | `night_limit_exceeded`, `high_amount_without_history` |
+| Velocity | Rápido demais? | `burst_4_in_10_minutes`, `burst_3_in_10_minutes` |
+| Montante | Somou demais? | `day_sum_3x_profile`, `day_sum_without_history` |
+| Perfil | Está no padrão do cliente? | `unusual_hour`, `rare_hour`, `night_without_history`, `amount_*_profile`, `far_from_usual_places`, `device_changed` |
+| Contraparte | Quem recebe é confiável? | `new_destination`, `new_destination_account`, `destination_many_payers`, `receita_destination_irregular`, `restricted_destination`, `receita_destination_blocked` |
+
+**Limite e Montante moram na métrica Valor, e não em métricas próprias.** As três perguntas (o valor cabe no ticket? passou do teto? a soma do dia passou do normal?) olham para o mesmo dinheiro. Em métricas separadas, um único Pix de R$ 5.000 à noite pontuaria três vezes pelo mesmo real e reprovaria sozinho, quebrando o princípio de que nenhuma métrica decide sozinha. Juntas, elas somam até o teto de 30.
 
 ### Os sinais
 
@@ -108,6 +150,9 @@ Os sinais de uma mesma métrica somam, mas nunca passam do teto dela.
 | `amount_3x_profile` (20) | Valor entre 3x e 5x o ticket médio | | Degraus, para que "um pouco acima" pese menos que "muito acima" |
 | `amount_2x_profile` (10) | Valor entre 2x e 3x o ticket médio | | |
 | `high_amount_without_history` (15) | Cliente sem ticket médio, Pix acima de R$ 1.000 | R$ 1.000 | Sem histórico, o limite noturno do Banco Central serve de referência de "valor alto" |
+| `night_limit_exceeded` (20) | **Limite.** Pix de pessoa física entre 20h e 6h, acima de R$ 1.000, e o cliente nunca fez um Pix noturno confiável acima disso | R$ 1.000; 20h–6h; só CPF; mínimo de 3 Pix confiáveis; 90 dias | R$ 1.000 é o limite noturno padrão do Banco Central para pessoa física (Resolução BCB nº 142/2021). O ticket médio não pega esse caso: para quem paga R$ 800 de costume, R$ 1.500 é só 1,9x. Quem já pagou acima do teto à noite, com Pix confiável, provou que aumentou o limite e não é punido. Sem histórico, `high_amount_without_history` já usa os mesmos R$ 1.000, por isso a regra não roda (contaria o mesmo fato duas vezes) |
+| `day_sum_3x_profile` (20) | **Montante.** A soma das últimas 24 h (Pix confiáveis + este) passou de 3x o total diário médio do cliente | 3x; 24 h; mínimo de 3 dias com Pix confiável em 90 dias; ao menos 2 Pix na janela; soma acima de R$ 1.000 | Pega o golpe que **fraciona** o valor para nenhum Pix parecer grande sozinho. O total diário médio só conta dias com Pix, e só antes da janela, para o golpe em curso não inflar a própria régua. Abaixo de R$ 1.000 no dia, a soma não pesa: não compensa a fricção |
+| `day_sum_without_history` (15) | **Montante.** Cliente sem total diário médio, soma das últimas 24 h acima de R$ 1.000 | R$ 1.000; 24 h; ao menos 2 Pix na janela | Sem histórico, a mesma referência de R$ 1.000: dez Pix de R$ 900 somam R$ 9.000, mas nenhum deles passaria em `high_amount_without_history` |
 | **Local** | | | |
 | `far_from_usual_places` (25) | Pix a mais de 30 km de **todos** os lugares de costume | 30 km; lugares de Pix confiáveis em 90 dias | 30 km cobre uma região metropolitana. A distância é até o lugar **mais perto**, e não até a média: quem mora em São Paulo e trabalha em Campinas teria a média no meio da estrada. Sem geolocalização (é opcional) ou sem lugar de costume, não roda |
 | **Velocidade** | | | |
@@ -128,6 +173,7 @@ Os sinais de uma mesma métrica somam, mas nunca passam do teto dela.
 | Regra | Lógica | Por quê |
 |---|---|---|
 | `invalid_document_number` | CPF/CNPJ de quem paga ou recebe com dígito verificador errado | Documento que não pode existir é payload adulterado. Reprova e fica gravado, em vez de virar 4xx |
+| `account_opened_after_pix` | A conta de quem paga ou de quem recebe foi aberta depois da data do Pix | Ninguém paga de uma conta que ainda não existe, nem recebe nela: é payload adulterado. Pelo mesmo motivo do documento inválido, reprova e fica gravado — todo Pix que chega fica consultável |
 | `restricted_payer` | Quem paga está na lista restritiva | Fraude confirmada, sanção ou ordem judicial |
 | `restricted_destination` | Quem recebe está na lista restritiva | Idem |
 | `receita_destination_blocked` | Na Receita, o documento de quem recebe não existe, foi cancelado, é nulo ou é de titular falecido | Ninguém legítimo recebe Pix num CPF assim: é o documento clássico de conta laranja |
@@ -155,6 +201,7 @@ Duas métricas fortes pedem 2FA; reprovar exige três. Exemplos:
 | Viagem: Pix à noite, em outra cidade, cliente sem histórico de horários | horário 20 + local 25 + destino 5 | `two_factor_required` |
 | Valor alto para conta aberta há 5 dias | valor 30 + destino 15 | `two_factor_required` |
 | Às 3h (nunca pagou nesse horário), de outra cidade, valor 6x o ticket | horário 35 + local 25 + valor 30 | `rejected` |
+| Fracionamento: 6 Pix de R$ 900 à noite, no mesmo segundo, de cliente sem histórico | 1º: horário 20 + destino 5. 2º: + soma do dia 15 + herança 12. 3º em diante: + velocidade e herança | 1º `approved`, 2º `two_factor_required`, demais `rejected` |
 
 ### Quando o motor pede 2FA
 
@@ -229,7 +276,7 @@ Se a Receita estiver lenta, fora do ar ou responder algo quebrado, o Pix segue c
 
 ### O que o motor não pega
 
-Um Pix pequeno, no horário de costume, de casa, para uma conta antiga e conhecida passa como `approved` — mesmo que seja o ladrão. Pegar esse caso exigiria pedir 2FA para quase todo Pix, e travar o cliente bom também é prejuízo. A troca é consciente.
+Um Pix pequeno, no horário de costume, de casa, para uma conta antiga e conhecida passa como `approved` — mesmo que seja o ladrão. Pegar esse caso exigiria pedir 2FA para quase todo Pix, e travar o cliente bom também é prejuízo. A troca é consciente. Pelo mesmo motivo, o golpe que fraciona o valor só pesa quando a soma do dia passa de R$ 1.000.
 
 ### O relógio do motor: a data do Pix, e não a hora de chegada
 
@@ -321,7 +368,14 @@ curl -X POST http://localhost:3000/pix/transaction/pix-000123/two-factor \
 | 2FA já respondido | 409 | `QIT002004` |
 | 2FA respondido depois do prazo | 409 | `QIT002006` |
 
-\* O `transaction_date` precisa estar entre 16/11/2020 (o lançamento do Pix) e 2100; as datas de abertura de conta, entre 1900 e 2100.
+\* O `transaction_date` precisa estar entre 16/11/2020 (o lançamento do Pix) e 2100; as datas de abertura de conta, entre 1900 e 2100. O fuso precisa existir no mundo: de −12:00 a +14:00.
+
+**O que a porta recusa, e por quê:**
+
+- **`amount` só como inteiro JSON.** `5000.0` e `1E2` são recusados: o valor é em centavos, e `9.2e18` chegaria com perda de precisão.
+- **Texto sem caractere de controle nem Unicode quebrado** (surrogate solto, como `\ud800`), em qualquer campo e em nome de campo: não cabem no banco nem numa resposta JSON.
+- **`id` que volta no endereço do GET**: sem `/`, espaço ou acento, e nem `.` ou `..`, que os clientes HTTP resolvem como pasta.
+- **Mensagens de erro curtas**: a descrição para em 500 caracteres. Um campo de 2 MB não volta inteiro na resposta.
 
 ### Rodar os testes
 
@@ -329,11 +383,15 @@ curl -X POST http://localhost:3000/pix/transaction/pix-000123/two-factor \
 docker compose --profile tests run --build --rm tests
 ```
 
-Os testes rodam num container próprio, contra a API de pé — sem Python na máquina. São três grupos:
+Os testes rodam num container próprio, contra a API de pé — sem Python na máquina. São dois grupos:
 
-- `tests/unit/`: o motor, sem banco — cada limiar testado na borda, as faixas, a herança, e as propriedades da tese (nenhuma métrica decide sozinha, horário pesa mais que local).
 - `tests/integration/pix_transaction/`: os cenários pela API — contrato, fatos, cada métrica, Receita, 2FA, herança e concorrência.
-- `tests/integration/test_input_robustness.py`: entrada torta de todo tipo (corpo que não é JSON, tipos errados, datas impossíveis, NaN, caracteres de controle, ids que não cabem num endereço). Nenhuma pode virar 500.
+- `tests/integration/test_input_robustness.py`: entrada torta de todo tipo. Nenhuma pode virar 500:
+  - **corpo:** o que não é JSON, JSON em UTF-16 ou com BOM, bytes que não são UTF-8, megabytes de espaço, 100 mil campos extras, corpo em chunks;
+  - **campos:** tipos errados, números com 5.000 dígitos, NaN e infinito, inteiro escrito como `5000.0`, surrogate solto, caracteres de controle;
+  - **datas:** datas impossíveis, fusos que não existem, conta aberta depois do Pix (reprovado e gravado);
+  - **HTTP:** todo método em toda rota, content-types estranhos, caminhos com bytes inválidos, tokens e `X-Request-ID` estranhos;
+  - **motor:** pontos antípodas e valores no limite do BIGINT somados.
 
 **Testando à mão:** o motor tem memória. Pix do mesmo pagador em sequência contam na velocidade e herdam o risco dos anteriores — é o comportamento esperado, e o `metadata.risk` mostra de onde veio cada ponto. Para cenários independentes, troque o CPF do pagador (e o `device_id`, para a métrica de origem não somar).
 
